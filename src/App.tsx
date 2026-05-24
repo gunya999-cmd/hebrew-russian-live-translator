@@ -11,9 +11,25 @@ function setupMessage() {
   return {
     setup: {
       model: 'models/gemini-2.5-flash-native-audio-preview-12-2025',
-      generationConfig: { responseModalities: ['AUDIO'], temperature: 0.2, speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } } },
-      systemInstruction: { parts: [{ text: 'Ты профессиональный синхронный переводчик. Входящая речь обычно на иврите. Переводи только на естественный разговорный русский. Не отвечай собеседнику и не добавляй объяснений. Говори коротко, как живой переводчик в наушнике.' }] },
-      realtimeInputConfig: { automaticActivityDetection: { disabled: false, startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH', endOfSpeechSensitivity: 'END_SENSITIVITY_HIGH', prefixPaddingMs: 100, silenceDurationMs: 650 }, activityHandling: 'NO_INTERRUPTION', turnCoverage: 'TURN_INCLUDES_ONLY_ACTIVITY' },
+      generationConfig: {
+        responseModalities: ['AUDIO'],
+        temperature: 0.2,
+        speechConfig: { voiceConfig: { prebuiltVoiceConfig: { voiceName: 'Kore' } } }
+      },
+      systemInstruction: {
+        parts: [{ text: 'You are a professional simultaneous interpreter. The incoming speech is usually Hebrew. Translate only into natural spoken Russian. Do not answer the speaker. Do not add explanations. Keep the translation short, like a live interpreter in an earpiece.' }]
+      },
+      realtimeInputConfig: {
+        automaticActivityDetection: {
+          disabled: false,
+          startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH',
+          endOfSpeechSensitivity: 'END_SENSITIVITY_HIGH',
+          prefixPaddingMs: 100,
+          silenceDurationMs: 650
+        },
+        activityHandling: 'NO_INTERRUPTION',
+        turnCoverage: 'TURN_INCLUDES_ONLY_ACTIVITY'
+      },
       inputAudioTranscription: {},
       outputAudioTranscription: {}
     }
@@ -35,8 +51,8 @@ export default function App() {
   const outRef = useRef<AudioBufferSourceNode[]>([]);
   const startedRef = useRef(false);
 
-  const subtitle = useMemo(() => status === 'idle' ? 'Надень AirPods, положи iPhone ближе к говорящему и нажми старт.' : status === 'listening' ? 'Слушаю иврит и отправляю русский перевод в аудиовыход iPhone.' : status === 'connecting' ? 'Соединяюсь с Cloudflare Worker и Gemini Live API…' : status === 'stopping' ? 'Останавливаю микрофон…' : 'Ошибка запуска.', [status]);
-  const addLog = (text: string) => setLog((items) => [`${new Date().toLocaleTimeString('ru-RU')} — ${text}`, ...items].slice(0, 8));
+  const subtitle = useMemo(() => status === 'idle' ? 'Put on AirPods, place the iPhone near the speaker, then press start.' : status === 'listening' ? 'Listening to Hebrew and sending Russian voice translation to the iPhone audio output.' : status === 'connecting' ? 'Connecting to Cloudflare Worker and Gemini Live API...' : status === 'stopping' ? 'Stopping microphone...' : 'Startup error.', [status]);
+  const addLog = (text: string) => setLog((items) => [`${new Date().toLocaleTimeString('ru-RU')} - ${text}`, ...items].slice(0, 8));
 
   function stopOutput() {
     for (const node of outRef.current) { try { node.stop(); } catch {} }
@@ -87,7 +103,7 @@ export default function App() {
     sourceRef.current = source;
     micRef.current = mic;
     setStatus('listening');
-    addLog('Микрофон включён.');
+    addLog('Microphone enabled.');
   }
 
   function onMessage(raw: MessageEvent) {
@@ -106,7 +122,7 @@ export default function App() {
   }
 
   async function start() {
-    setError(''); setInputText(''); setOutputText(''); setStatus('connecting'); startedRef.current = false; addLog('Старт сессии.');
+    setError(''); setInputText(''); setOutputText(''); setStatus('connecting'); startedRef.current = false; addLog('Session started.');
     try {
       const AudioContextCtor = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
       const ctx = new AudioContextCtor({ latencyHint: 'interactive' });
@@ -116,13 +132,13 @@ export default function App() {
       wsRef.current = ws;
       ws.onopen = () => ws.send(JSON.stringify(setupMessage()));
       ws.onmessage = onMessage;
-      ws.onerror = () => { setStatus('error'); setError('WebSocket error. Проверь Cloudflare Worker, GEMINI_API_KEY и доступ к Gemini Live model.'); };
-      ws.onclose = (event) => { if (status !== 'stopping') addLog(`WebSocket закрыт ${event.code || ''} ${event.reason || ''}`.trim()); };
-    } catch (e) { setStatus('error'); setError(e instanceof Error ? e.message : 'Не удалось запустить перевод.'); }
+      ws.onerror = () => { setStatus('error'); setError('WebSocket error. Check Cloudflare Worker, GEMINI_API_KEY, and Gemini Live model access.'); };
+      ws.onclose = (event) => { if (status !== 'stopping') addLog(`WebSocket closed ${event.code || ''} ${event.reason || ''}`.trim()); };
+    } catch (e) { setStatus('error'); setError(e instanceof Error ? e.message : 'Could not start translator.'); }
   }
 
   async function stop() {
-    setStatus('stopping'); addLog('Остановка.');
+    setStatus('stopping'); addLog('Stopping.');
     stopOutput();
     try { micRef.current?.disconnect(); sourceRef.current?.disconnect(); } catch {}
     streamRef.current?.getTracks().forEach((t) => t.stop());
@@ -132,5 +148,5 @@ export default function App() {
     setStatus('idle');
   }
 
-  return <main className="app-shell"><section className="hero-card"><div className="eyebrow">Hebrew → Russian · Live Audio</div><h1>Перевод иврита в русский голос прямо в наушник</h1><p className="subtitle">{subtitle}</p>{error && <div className="error">{error}</div>}<div className="controls"><button className="primary" disabled={status !== 'idle' && status !== 'error'} onClick={start}>Начать перевод</button><button className="secondary" disabled={status === 'idle' || status === 'stopping'} onClick={() => void stop()}>Остановить</button></div><div className={`status-pill ${status}`}><span />{status}</div></section><section className="grid"><div className="panel"><h2>Что слышит система</h2><p>{inputText || 'Транскрипция появится здесь.'}</p></div><div className="panel"><h2>Русский перевод</h2><p>{outputText || 'Основной результат идёт голосом в наушник.'}</p></div></section><section className="panel log-panel"><h2>Лог</h2>{log.length ? <ul>{log.map((item, i) => <li key={i}>{item}</li>)}</ul> : <p>Лог пуст.</p>}</section></main>;
+  return <main className="app-shell"><section className="hero-card"><div className="eyebrow">Hebrew -> Russian · Live Audio</div><h1>Hebrew to Russian voice translation in your headphones</h1><p className="subtitle">{subtitle}</p>{error && <div className="error">{error}</div>}<div className="controls"><button className="primary" disabled={status !== 'idle' && status !== 'error'} onClick={start}>Start translation</button><button className="secondary" disabled={status === 'idle' || status === 'stopping'} onClick={() => void stop()}>Stop</button></div><div className={`status-pill ${status}`}><span />{status}</div></section><section className="grid"><div className="panel"><h2>Input speech</h2><p>{inputText || 'Input transcript will appear here.'}</p></div><div className="panel"><h2>Russian translation</h2><p>{outputText || 'The main result is played as voice in your headphones.'}</p></div></section><section className="panel log-panel"><h2>Log</h2>{log.length ? <ul>{log.map((item, i) => <li key={i}>{item}</li>)}</ul> : <p>Log is empty.</p>}</section></main>;
 }
