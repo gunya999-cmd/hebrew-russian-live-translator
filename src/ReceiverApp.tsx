@@ -12,8 +12,8 @@ const WS_URL = import.meta.env.VITE_WS_URL || `${location.protocol === 'https:' 
 const MODEL = 'models/gemini-3.1-flash-live-preview';
 const GAIN = 12;
 const LEVEL_SCALE = 2600;
-const SEGMENT_MS = 650;
-const MIN_CHUNKS = 8;
+const SEGMENT_MS = 280;
+const MIN_CHUNKS = 3;
 const MAX_TEXT = 900;
 const isAirPods = (label = '') => label.toLowerCase().includes('airpods');
 const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
