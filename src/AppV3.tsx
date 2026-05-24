@@ -82,7 +82,7 @@ function setupMessage() {
 }
 
 function audioMessage(base64: string) {
-  return { realtimeInput: { mediaChunks: [{ mimeType: `audio/pcm;rate=${INPUT_SAMPLE_RATE}`, data: base64 }] } };
+  return { realtimeInput: { audio: { mimeType: `audio/pcm;rate=${INPUT_SAMPLE_RATE}`, data: base64 } } };
 }
 
 export default function AppV3() {
