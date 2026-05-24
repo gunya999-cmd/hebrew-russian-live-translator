@@ -9,10 +9,10 @@ declare global { interface Window { webkitAudioContext?: typeof AudioContext } }
 
 const WS_URL = import.meta.env.VITE_WS_URL || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
 const MODEL = 'models/gemini-3.1-flash-live-preview';
-const GAIN = 8;
-const GATE = 6;
-const LEVEL_SCALE = 1800;
-const HANGOVER_MS = 900;
+const GAIN = 12;
+const GATE = 3;
+const LEVEL_SCALE = 2600;
+const HANGOVER_MS = 1200;
 const SILENCE_END_MS = 1400;
 const ROLLING_END_MS = 900;
 const MIN_ROLLING_CHUNKS = 12;
@@ -57,7 +57,7 @@ function boost(samples: Float32Array): Float32Array {
 }
 
 function micConstraints(deviceId?: string): MediaStreamConstraints {
-  const audio: MediaTrackConstraints = { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+  const audio: MediaTrackConstraints = { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: true };
   if (deviceId) audio.deviceId = { exact: deviceId };
   return { audio, video: false };
 }
