@@ -14,6 +14,34 @@ export default {
   }
 };
 
+function normalizeClientMessage(data: string | ArrayBuffer): string | ArrayBuffer {
+  if (typeof data !== 'string') return data;
+
+  try {
+    const message = JSON.parse(data) as Record<string, unknown>;
+    const maybeConfig = message.config;
+
+    if (maybeConfig && typeof maybeConfig === 'object') {
+      const config = maybeConfig as Record<string, unknown>;
+      return JSON.stringify({
+        setup: {
+          model: config.model,
+          generationConfig: {
+            responseModalities: config.responseModalities ?? ['AUDIO']
+          },
+          systemInstruction: config.systemInstruction,
+          inputAudioTranscription: config.inputAudioTranscription ?? {},
+          outputAudioTranscription: config.outputAudioTranscription ?? {}
+        }
+      });
+    }
+
+    return data;
+  } catch {
+    return data;
+  }
+}
+
 async function handleWebSocketProxy(request: Request, env: Env): Promise<Response> {
   if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
     return new Response('Expected WebSocket upgrade', { status: 426 });
@@ -55,7 +83,7 @@ async function handleWebSocketProxy(request: Request, env: Env): Promise<Respons
 
   serverSocket.addEventListener('message', (event) => {
     try {
-      if (upstreamSocket.readyState === WebSocket.OPEN) upstreamSocket.send(event.data);
+      if (upstreamSocket.readyState === WebSocket.OPEN) upstreamSocket.send(normalizeClientMessage(event.data));
     } catch (error) {
       console.error('client-to-upstream failed', error instanceof Error ? error.message : String(error));
       closeBoth(1011, 'client-to-upstream failed');
