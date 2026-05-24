@@ -22,7 +22,9 @@ function makeAudioContext(): AudioContext {
 
 async function messageToText(data: unknown): Promise<string> {
   if (typeof data === 'string') return data;
-  if (data instanceof Blob) return data.text();
+  const maybeBlob = data as { text?: () => Promise<string>; arrayBuffer?: () => Promise<ArrayBuffer> };
+  if (maybeBlob && typeof maybeBlob.text === 'function') return maybeBlob.text();
+  if (maybeBlob && typeof maybeBlob.arrayBuffer === 'function') return new TextDecoder().decode(await maybeBlob.arrayBuffer());
   if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
   if (ArrayBuffer.isView(data)) return new TextDecoder().decode(data.buffer);
   return String(data);
@@ -73,12 +75,18 @@ export default function ChromeFastApp() {
   const playAtRef = useRef(0);
   const outputNodesRef = useRef<AudioBufferSourceNode[]>([]);
   const audioEnabledRef = useRef(false);
+  const sendAudioRef = useRef(false);
   const lastVoiceAtRef = useRef(0);
   const chunksRef = useRef(0);
   const inboundRef = useRef(0);
   const audioInRef = useRef(0);
 
   const addLog = (text: string) => setLog((items) => [`${new Date().toLocaleTimeString()} - ${text}`, ...items].slice(0, 16));
+
+  function reusableIphoneMic(): boolean {
+    const track = streamRef.current?.getAudioTracks()[0];
+    return Boolean(track && track.readyState === 'live' && !isAirPods(track.label));
+  }
 
   async function openMicStream(deviceId?: string): Promise<MediaStream> {
     const audio: MediaTrackConstraints = { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false };
@@ -88,6 +96,7 @@ export default function ChromeFastApp() {
 
   async function getIphoneMic(): Promise<MediaStream> {
     const first = await openMicStream();
+    await new Promise((resolve) => window.setTimeout(resolve, 500));
     const firstLabel = first.getAudioTracks()[0]?.label || 'iPhone microphone';
     if (!isAirPods(firstLabel)) {
       setActiveMic(firstLabel);
@@ -104,6 +113,7 @@ export default function ChromeFastApp() {
     for (const candidate of candidates) {
       try {
         const stream = await openMicStream(candidate.deviceId);
+        await new Promise((resolve) => window.setTimeout(resolve, 500));
         const label = stream.getAudioTracks()[0]?.label || candidate.label || 'iPhone microphone';
         if (!isAirPods(label)) {
           setActiveMic(label);
@@ -116,7 +126,7 @@ export default function ChromeFastApp() {
       }
     }
 
-    throw new Error('Chrome still selected AirPods as microphone. Disconnect AirPods, press Start listening, then choose AirPods as output in Control Center.');
+    throw new Error('Chrome still selected AirPods as microphone. Disconnect AirPods, press Test mic first, then Start listening, then choose AirPods as output in Control Center.');
   }
 
   function stopOutput() {
@@ -149,12 +159,7 @@ export default function ChromeFastApp() {
     if (inboundRef.current === 1 || inboundRef.current % 10 === 0) addLog(`Gemini messages received: ${inboundRef.current}.`);
 
     let msg: LiveMessage;
-    try {
-      msg = JSON.parse(raw);
-    } catch {
-      addLog(`Unreadable Gemini message: ${raw.slice(0, 120)}`);
-      return;
-    }
+    try { msg = JSON.parse(raw); } catch { addLog(`Unreadable Gemini message: ${raw.slice(0, 120)}`); return; }
 
     if (msg.setupComplete) addLog('Gemini setupComplete received.');
     if (msg.error?.message) { setError(msg.error.message); setStatus('error'); addLog(`Gemini error: ${msg.error.message}`); }
@@ -173,6 +178,7 @@ export default function ChromeFastApp() {
   }
 
   async function openMic(sendAudio: boolean) {
+    sendAudioRef.current = sendAudio;
     const ctx = ctxRef.current || makeAudioContext();
     ctxRef.current = ctx;
     await ctx.resume();
@@ -188,7 +194,7 @@ export default function ChromeFastApp() {
       const samples = event.data;
       const current = micLevel(samples);
       setLevel(current);
-      if (!sendAudio) return;
+      if (!sendAudioRef.current) return;
       const now = performance.now();
       if (current >= VOICE_GATE) lastVoiceAtRef.current = now;
       if (now - lastVoiceAtRef.current > SILENCE_MS) return;
@@ -212,6 +218,7 @@ export default function ChromeFastApp() {
 
   async function stop(reset = true) {
     audioEnabledRef.current = false;
+    sendAudioRef.current = false;
     try { workletRef.current?.disconnect(); sourceRef.current?.disconnect(); } catch {}
     streamRef.current?.getTracks().forEach((track) => track.stop());
     try { wsRef.current?.close(1000, 'stop'); } catch {}
@@ -226,7 +233,7 @@ export default function ChromeFastApp() {
   }
 
   async function testMic() {
-    try { await stop(false); setStatus('testing'); setError(''); await openMic(false); addLog('Mic test is running.'); }
+    try { await stop(false); setStatus('testing'); setError(''); await openMic(false); addLog('Mic test is running. Press Start listening now to reuse this mic.'); }
     catch (err) { const message = err instanceof Error ? err.message : String(err); setError(message); setStatus('error'); addLog(message); }
   }
 
@@ -249,7 +256,10 @@ export default function ChromeFastApp() {
 
   async function startListening() {
     try {
-      await stop(false);
+      const reuseMic = reusableIphoneMic();
+      if (!reuseMic) await stop(false);
+      else addLog('Reusing iPhone mic from Mic test.');
+
       setStatus('connecting');
       setError('');
       setInputText('');
@@ -258,7 +268,10 @@ export default function ChromeFastApp() {
       chunksRef.current = 0;
       inboundRef.current = 0;
       audioInRef.current = 0;
-      await openMic(true);
+
+      if (!reuseMic) await openMic(true);
+      else sendAudioRef.current = true;
+
       const ws = new WebSocket(WS_URL);
       ws.binaryType = 'arraybuffer';
       wsRef.current = ws;
@@ -282,7 +295,7 @@ export default function ChromeFastApp() {
     <section className="hero-card">
       <div className="eyebrow">Chrome first live translator</div>
       <h1>Hebrew to Russian live audio translator</h1>
-      <p className="subtitle">Start listening once. Speak Hebrew. Russian audio should play through the current iOS output device.</p>
+      <p className="subtitle">Best flow with AirPods: Test mic first. If Active is iPhone mic, press Start listening. Russian audio should play through current iOS output.</p>
       {error && <div className="error">{error}</div>}
       <div className="controls">
         <button className="primary" disabled={status === 'connecting' || status === 'listening'} onClick={() => void startListening()}>Start listening</button>
@@ -294,7 +307,7 @@ export default function ChromeFastApp() {
     </section>
     <section className="grid">
       <div className="panel"><h2>Microphone</h2><p>Active: {activeMic}</p><div className="meter"><div style={{ width: `${level}%` }} /></div><p>Mic level: {level}%</p></div>
-      <div className="panel"><h2>Diagnostics</h2><p>Look for: Gemini messages received, Input, Output, Gemini audio chunk received.</p></div>
+      <div className="panel"><h2>Diagnostics</h2><p>Look for: Reusing iPhone mic, Audio chunks sent, Gemini messages received, Input, Output, Gemini audio chunk received.</p></div>
     </section>
     <section className="grid"><div className="panel"><h2>Input speech</h2><p>{inputText || 'Input transcript will appear here.'}</p></div><div className="panel"><h2>Russian translation</h2><p>{outputText || 'Russian translation will appear here.'}</p></div></section>
     <section className="panel log-panel"><h2>Log</h2>{log.length ? <ul>{log.map((item, index) => <li key={index}>{item}</li>)}</ul> : <p>Log is empty.</p>}</section>
