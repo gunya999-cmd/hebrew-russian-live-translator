@@ -2,7 +2,7 @@ import { useRef, useState } from 'react';
 import { INPUT_SAMPLE_RATE, arrayBufferToBase64, base64ToInt16Array, downsampleBuffer, floatTo16BitPCM, int16ToFloat32, parseSampleRateFromMimeType } from './audio';
 
 type Status = 'idle' | 'connecting' | 'listening' | 'error';
-type Part = { text?: string; inlineData?: { data?: string; mimeType?: string }; inline_data?: { data?: string; mimeType?: string } };
+type Part = { text?: string; inlineData?: { data?: string; mimeType?: string; mime_type?: string }; inline_data?: { data?: string; mimeType?: string; mime_type?: string } };
 type Msg = { setupComplete?: unknown; error?: { message?: string }; serverContent?: { interrupted?: boolean; generationComplete?: boolean; turnComplete?: boolean; inputTranscription?: { text?: string }; outputTranscription?: { text?: string }; modelTurn?: { parts?: Part[] } } };
 
 declare global { interface Window { webkitAudioContext?: typeof AudioContext } }
@@ -13,7 +13,9 @@ const GAIN = 8;
 const GATE = 6;
 const LEVEL_SCALE = 1800;
 const HANGOVER_MS = 900;
-const END_MS = 1400;
+const SILENCE_END_MS = 1400;
+const ROLLING_END_MS = 900;
+const MIN_ROLLING_CHUNKS = 12;
 
 const isAirPods = (label = '') => label.toLowerCase().includes('airpods');
 const sleep = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -32,6 +34,14 @@ async function asText(data: unknown): Promise<string> {
   if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
   if (ArrayBuffer.isView(data)) return new TextDecoder().decode(data.buffer);
   return String(data);
+}
+
+function appendChunk(previous: string, chunk: string): string {
+  const text = chunk.trim();
+  if (!text) return previous;
+  if (!previous) return text;
+  if (/^[,.;:!?…)]/.test(text)) return `${previous}${text}`;
+  return `${previous} ${text}`;
 }
 
 function micLevel(samples: Float32Array): number {
@@ -78,11 +88,16 @@ async function openIphoneMic(log: (s: string) => void): Promise<MediaStream> {
 }
 
 function setupMessage() {
-  return { config: { model: MODEL, responseModalities: ['AUDIO'], systemInstruction: { parts: [{ text: 'Translate Hebrew speech into natural spoken Russian only. Do not answer. Do not explain.' }] }, inputAudioTranscription: {}, outputAudioTranscription: {} } };
+  return { config: { model: MODEL, responseModalities: ['AUDIO'], systemInstruction: { parts: [{ text: 'Translate Hebrew speech into natural spoken Russian only. Do not answer. Do not explain. Start translating as soon as meaning is clear. Prefer short streaming translation chunks over waiting for the full sentence.' }] }, inputAudioTranscription: {}, outputAudioTranscription: {} } };
 }
 
 function audioMessage(base64: string) {
   return { realtimeInput: { audio: { mimeType: `audio/pcm;rate=${INPUT_SAMPLE_RATE}`, data: base64 } } };
+}
+
+function audioFromPart(part: Part): { data?: string; mimeType?: string } {
+  const inline = part.inlineData || part.inline_data;
+  return { data: inline?.data, mimeType: inline?.mimeType || inline?.mime_type };
 }
 
 export default function AppV3() {
@@ -105,28 +120,42 @@ export default function AppV3() {
   const readyRef = useRef(false);
   const lastVoiceRef = useRef(0);
   const sentSinceEndRef = useRef(false);
-  const endTimerRef = useRef<number | null>(null);
+  const silenceTimerRef = useRef<number | null>(null);
   const sentRef = useRef(0);
+  const rollingChunksRef = useRef(0);
+  const lastRollingEndRef = useRef(0);
   const serverRef = useRef(0);
   const gotAudioRef = useRef(0);
+  const inputAccRef = useRef('');
+  const outputAccRef = useRef('');
 
-  const addLog = (text: string) => setLog((items) => [`${new Date().toLocaleTimeString()} - ${text}`, ...items].slice(0, 14));
+  const addLog = (text: string) => setLog((items) => [`${new Date().toLocaleTimeString()} - ${text}`, ...items].slice(0, 16));
 
-  function clearEndTimer() {
-    if (endTimerRef.current !== null) window.clearTimeout(endTimerRef.current);
-    endTimerRef.current = null;
+  function clearSilenceTimer() {
+    if (silenceTimerRef.current !== null) window.clearTimeout(silenceTimerRef.current);
+    silenceTimerRef.current = null;
   }
 
-  function phraseEndSoon() {
-    clearEndTimer();
-    endTimerRef.current = window.setTimeout(() => {
-      const ws = wsRef.current;
-      if (ws?.readyState === WebSocket.OPEN && sentSinceEndRef.current) {
-        ws.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
-        sentSinceEndRef.current = false;
-        addLog('Audio stream end sent.');
-      }
-    }, END_MS);
+  function sendStreamEnd(reason: 'rolling' | 'silence' | 'stop') {
+    const ws = wsRef.current;
+    if (!ws || ws.readyState !== WebSocket.OPEN || !sentSinceEndRef.current) return;
+    ws.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
+    sentSinceEndRef.current = false;
+    rollingChunksRef.current = 0;
+    lastRollingEndRef.current = performance.now();
+    if (reason === 'rolling') addLog('Rolling segment sent.');
+    if (reason === 'silence') addLog('Silence segment sent.');
+  }
+
+  function endAfterSilence() {
+    clearSilenceTimer();
+    silenceTimerRef.current = window.setTimeout(() => sendStreamEnd('silence'), SILENCE_END_MS);
+  }
+
+  function maybeRollingEnd(now: number) {
+    if (rollingChunksRef.current < MIN_ROLLING_CHUNKS) return;
+    if (now - lastRollingEndRef.current < ROLLING_END_MS) return;
+    sendStreamEnd('rolling');
   }
 
   function stopOutput() {
@@ -162,18 +191,28 @@ export default function AppV3() {
 
     serverRef.current += 1;
     const parts = content.modelTurn?.parts?.length || 0;
-    if (serverRef.current <= 8 || serverRef.current % 10 === 0) addLog(`Server: ${Object.keys(content).join(',') || 'empty'} parts=${parts}`);
+    if (serverRef.current <= 4 || serverRef.current % 20 === 0) addLog(`Server: ${Object.keys(content).join(',') || 'empty'} parts=${parts}`);
 
     if (content.interrupted) stopOutput();
     if (content.generationComplete) addLog('Generation complete.');
-    if (content.turnComplete) addLog('Turn complete.');
-    if (content.inputTranscription?.text) { setInput(content.inputTranscription.text); addLog(`Input: ${content.inputTranscription.text.slice(0, 70)}`); }
-    if (content.outputTranscription?.text) { setOutput(content.outputTranscription.text); addLog(`Output: ${content.outputTranscription.text.slice(0, 70)}`); }
+    if (content.turnComplete) addLog(`Final: ${(outputAccRef.current || output).slice(0, 100)}`);
+
+    if (content.inputTranscription?.text) {
+      inputAccRef.current = appendChunk(inputAccRef.current, content.inputTranscription.text);
+      setInput(inputAccRef.current);
+    }
+    if (content.outputTranscription?.text) {
+      outputAccRef.current = appendChunk(outputAccRef.current, content.outputTranscription.text);
+      setOutput(outputAccRef.current);
+    }
 
     for (const part of content.modelTurn?.parts || []) {
-      if (part.text) { setOutput(part.text); addLog(`Text: ${part.text.slice(0, 70)}`); }
-      const audio = part.inlineData || part.inline_data;
-      if (audio?.data) {
+      if (part.text) {
+        outputAccRef.current = appendChunk(outputAccRef.current, part.text);
+        setOutput(outputAccRef.current);
+      }
+      const audio = audioFromPart(part);
+      if (audio.data) {
         gotAudioRef.current += 1;
         if (gotAudioRef.current === 1) addLog('Translation audio received.');
         playPcm(audio.data, audio.mimeType);
@@ -206,7 +245,9 @@ export default function AppV3() {
       ws.send(JSON.stringify(audioMessage(arrayBufferToBase64(pcm.buffer))));
       sentSinceEndRef.current = true;
       sentRef.current += 1;
-      phraseEndSoon();
+      rollingChunksRef.current += 1;
+      endAfterSilence();
+      maybeRollingEnd(now);
       if (sentRef.current === 1 || sentRef.current % 100 === 0) addLog(`Audio sent: ${sentRef.current}.`);
     };
 
@@ -226,8 +267,12 @@ export default function AppV3() {
       setOutput('');
       setLevel(0);
       sentRef.current = 0;
+      rollingChunksRef.current = 0;
+      lastRollingEndRef.current = performance.now();
       serverRef.current = 0;
       gotAudioRef.current = 0;
+      inputAccRef.current = '';
+      outputAccRef.current = '';
       readyRef.current = false;
       sentSinceEndRef.current = false;
       const stream = await openIphoneMic(addLog);
@@ -250,9 +295,10 @@ export default function AppV3() {
   }
 
   async function stop(reset = true) {
+    sendStreamEnd('stop');
     runningRef.current = false;
     readyRef.current = false;
-    clearEndTimer();
+    clearSilenceTimer();
     try { workletRef.current?.disconnect(); sourceRef.current?.disconnect(); } catch {}
     streamRef.current?.getTracks().forEach((track) => track.stop());
     try { wsRef.current?.close(1000, 'stop'); } catch {}
@@ -267,7 +313,7 @@ export default function AppV3() {
   }
 
   return <main className="app-shell">
-    <section className="hero-card"><div className="eyebrow">V3 Chrome live translator</div><h1>Hebrew to Russian live translator</h1><p className="subtitle">One button. Opens iPhone mic, connects to Gemini, and translates until Stop.</p>{error && <div className="error">{error}</div>}<div className="controls"><button className="primary" disabled={status === 'connecting' || status === 'listening'} onClick={() => void start()}>Start</button><button className="secondary" onClick={() => void stop()}>Stop</button></div><div className={`status-pill ${status}`}><span />{status}</div></section>
+    <section className="hero-card"><div className="eyebrow">V3 Chrome live translator</div><h1>Hebrew to Russian live translator</h1><p className="subtitle">One button. Rolling low-latency Hebrew to Russian translation until Stop.</p>{error && <div className="error">{error}</div>}<div className="controls"><button className="primary" disabled={status === 'connecting' || status === 'listening'} onClick={() => void start()}>Start</button><button className="secondary" onClick={() => void stop()}>Stop</button></div><div className={`status-pill ${status}`}><span />{status}</div></section>
     <section className="grid"><div className="panel"><h2>Microphone</h2><p>Active: {micName}</p><div className="meter"><div style={{ width: `${level}%` }} /></div><p>Mic level: {level}%</p></div><div className="panel"><h2>Russian translation</h2><p>{output || 'Russian voice and text will appear here.'}</p></div></section>
     <section className="grid"><div className="panel"><h2>Hebrew input</h2><p>{input || 'Hebrew transcript will appear here.'}</p></div><div className="panel"><h2>Log</h2>{log.length ? <ul>{log.map((item, index) => <li key={index}>{item}</li>)}</ul> : <p>Log is empty.</p>}</div></section>
   </main>;
