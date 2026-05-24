@@ -3,7 +3,7 @@ import { INPUT_SAMPLE_RATE, arrayBufferToBase64, base64ToInt16Array, downsampleB
 
 type Status = 'idle' | 'connecting' | 'listening' | 'error';
 type Part = { text?: string; inlineData?: { data?: string; mimeType?: string }; inline_data?: { data?: string; mimeType?: string } };
-type Msg = { setupComplete?: unknown; error?: { message?: string }; serverContent?: { interrupted?: boolean; inputTranscription?: { text?: string }; outputTranscription?: { text?: string }; modelTurn?: { parts?: Part[] } } };
+type Msg = { setupComplete?: unknown; error?: { message?: string }; serverContent?: { interrupted?: boolean; generationComplete?: boolean; turnComplete?: boolean; inputTranscription?: { text?: string }; outputTranscription?: { text?: string }; modelTurn?: { parts?: Part[] } } };
 
 declare global { interface Window { webkitAudioContext?: typeof AudioContext } }
 
@@ -107,9 +107,10 @@ export default function AppV3() {
   const sentSinceEndRef = useRef(false);
   const endTimerRef = useRef<number | null>(null);
   const sentRef = useRef(0);
+  const serverRef = useRef(0);
   const gotAudioRef = useRef(0);
 
-  const addLog = (text: string) => setLog((items) => [`${new Date().toLocaleTimeString()} - ${text}`, ...items].slice(0, 12));
+  const addLog = (text: string) => setLog((items) => [`${new Date().toLocaleTimeString()} - ${text}`, ...items].slice(0, 14));
 
   function clearEndTimer() {
     if (endTimerRef.current !== null) window.clearTimeout(endTimerRef.current);
@@ -123,6 +124,7 @@ export default function AppV3() {
       if (ws?.readyState === WebSocket.OPEN && sentSinceEndRef.current) {
         ws.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
         sentSinceEndRef.current = false;
+        addLog('Audio stream end sent.');
       }
     }, END_MS);
   }
@@ -154,13 +156,22 @@ export default function AppV3() {
     try { msg = JSON.parse(await asText(event.data)); } catch (e) { addLog(`Bad Gemini message: ${e instanceof Error ? e.message : String(e)}`); return; }
     if (msg.setupComplete) { readyRef.current = true; addLog('Gemini ready.'); }
     if (msg.error?.message) { setError(msg.error.message); setStatus('error'); addLog(`Gemini error: ${msg.error.message}`); }
+
     const content = msg.serverContent;
     if (!content) return;
+
+    serverRef.current += 1;
+    const parts = content.modelTurn?.parts?.length || 0;
+    if (serverRef.current <= 8 || serverRef.current % 10 === 0) addLog(`Server: ${Object.keys(content).join(',') || 'empty'} parts=${parts}`);
+
     if (content.interrupted) stopOutput();
-    if (content.inputTranscription?.text) setInput(content.inputTranscription.text);
-    if (content.outputTranscription?.text) setOutput(content.outputTranscription.text);
+    if (content.generationComplete) addLog('Generation complete.');
+    if (content.turnComplete) addLog('Turn complete.');
+    if (content.inputTranscription?.text) { setInput(content.inputTranscription.text); addLog(`Input: ${content.inputTranscription.text.slice(0, 70)}`); }
+    if (content.outputTranscription?.text) { setOutput(content.outputTranscription.text); addLog(`Output: ${content.outputTranscription.text.slice(0, 70)}`); }
+
     for (const part of content.modelTurn?.parts || []) {
-      if (part.text) setOutput(part.text);
+      if (part.text) { setOutput(part.text); addLog(`Text: ${part.text.slice(0, 70)}`); }
       const audio = part.inlineData || part.inline_data;
       if (audio?.data) {
         gotAudioRef.current += 1;
@@ -215,6 +226,7 @@ export default function AppV3() {
       setOutput('');
       setLevel(0);
       sentRef.current = 0;
+      serverRef.current = 0;
       gotAudioRef.current = 0;
       readyRef.current = false;
       sentSinceEndRef.current = false;
