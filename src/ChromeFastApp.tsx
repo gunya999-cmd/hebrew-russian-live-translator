@@ -20,6 +20,14 @@ function makeAudioContext(): AudioContext {
   return new Ctor({ latencyHint: 'interactive' });
 }
 
+async function messageToText(data: unknown): Promise<string> {
+  if (typeof data === 'string') return data;
+  if (data instanceof Blob) return data.text();
+  if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
+  if (ArrayBuffer.isView(data)) return new TextDecoder().decode(data.buffer);
+  return String(data);
+}
+
 function micLevel(samples: Float32Array): number {
   let sum = 0;
   for (let i = 0; i < samples.length; i += 1) sum += samples[i] * samples[i];
@@ -67,8 +75,10 @@ export default function ChromeFastApp() {
   const audioEnabledRef = useRef(false);
   const lastVoiceAtRef = useRef(0);
   const chunksRef = useRef(0);
+  const inboundRef = useRef(0);
+  const audioInRef = useRef(0);
 
-  const addLog = (text: string) => setLog((items) => [`${new Date().toLocaleTimeString()} - ${text}`, ...items].slice(0, 12));
+  const addLog = (text: string) => setLog((items) => [`${new Date().toLocaleTimeString()} - ${text}`, ...items].slice(0, 16));
 
   async function openMicStream(deviceId?: string): Promise<MediaStream> {
     const audio: MediaTrackConstraints = { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false };
@@ -119,7 +129,8 @@ export default function ChromeFastApp() {
     const ctx = ctxRef.current;
     if (!ctx) return;
     const floats = int16ToFloat32(base64ToInt16Array(data));
-    const buffer = ctx.createBuffer(1, floats.length, parseSampleRateFromMimeType(mimeType));
+    const sampleRate = parseSampleRateFromMimeType(mimeType);
+    const buffer = ctx.createBuffer(1, floats.length, sampleRate);
     buffer.copyToChannel(floats, 0);
     const src = ctx.createBufferSource();
     src.buffer = buffer;
@@ -129,21 +140,35 @@ export default function ChromeFastApp() {
     playAtRef.current = startAt + buffer.duration;
     outputNodesRef.current.push(src);
     src.onended = () => { outputNodesRef.current = outputNodesRef.current.filter((node) => node !== src); };
+    addLog(`Queued Gemini audio ${Math.round(buffer.duration * 1000)}ms.`);
   }
 
-  function onLiveMessage(event: MessageEvent) {
+  async function onLiveMessage(event: MessageEvent) {
+    inboundRef.current += 1;
+    const raw = await messageToText(event.data);
+    if (inboundRef.current === 1 || inboundRef.current % 10 === 0) addLog(`Gemini messages received: ${inboundRef.current}.`);
+
     let msg: LiveMessage;
-    try { msg = JSON.parse(String(event.data)); } catch { addLog('Non-JSON message from Gemini.'); return; }
+    try {
+      msg = JSON.parse(raw);
+    } catch {
+      addLog(`Unreadable Gemini message: ${raw.slice(0, 120)}`);
+      return;
+    }
+
     if (msg.setupComplete) addLog('Gemini setupComplete received.');
     if (msg.error?.message) { setError(msg.error.message); setStatus('error'); addLog(`Gemini error: ${msg.error.message}`); }
+
     const content = msg.serverContent;
     if (!content) return;
+
     if (content.interrupted) stopOutput();
-    if (content.inputTranscription?.text) setInputText(content.inputTranscription.text);
-    if (content.outputTranscription?.text) setOutputText(content.outputTranscription.text);
+    if (content.inputTranscription?.text) { setInputText(content.inputTranscription.text); addLog(`Input: ${content.inputTranscription.text.slice(0, 80)}`); }
+    if (content.outputTranscription?.text) { setOutputText(content.outputTranscription.text); addLog(`Output: ${content.outputTranscription.text.slice(0, 80)}`); }
+
     for (const part of content.modelTurn?.parts || []) {
-      if (part.text) setOutputText(part.text);
-      if (part.inlineData?.data) playPcm(part.inlineData.data, part.inlineData.mimeType);
+      if (part.text) { setOutputText(part.text); addLog(`Text part: ${part.text.slice(0, 80)}`); }
+      if (part.inlineData?.data) { audioInRef.current += 1; addLog(`Gemini audio chunk received: ${audioInRef.current}.`); playPcm(part.inlineData.data, part.inlineData.mimeType); }
     }
   }
 
@@ -231,8 +256,11 @@ export default function ChromeFastApp() {
       setOutputText('');
       setLevel(0);
       chunksRef.current = 0;
+      inboundRef.current = 0;
+      audioInRef.current = 0;
       await openMic(true);
       const ws = new WebSocket(WS_URL);
+      ws.binaryType = 'arraybuffer';
       wsRef.current = ws;
       ws.onopen = () => {
         ws.send(JSON.stringify(configMessage()));
@@ -240,8 +268,11 @@ export default function ChromeFastApp() {
         lastVoiceAtRef.current = performance.now();
         setStatus('listening');
         addLog('WebSocket open. Config sent. Audio gate enabled.');
+        window.setTimeout(() => {
+          if (wsRef.current === ws && chunksRef.current > 0 && inboundRef.current === 0) addLog(`No Gemini messages after ${chunksRef.current} audio chunks.`);
+        }, 12000);
       };
-      ws.onmessage = onLiveMessage;
+      ws.onmessage = (event) => { void onLiveMessage(event); };
       ws.onerror = () => { setStatus('error'); setError('WebSocket error. Check /debug, API key, Live API access, or model access.'); addLog('WebSocket error.'); };
       ws.onclose = (event) => { addLog(`WebSocket closed ${event.code || ''} ${event.reason || ''}`.trim()); if (event.code !== 1000) setStatus('error'); };
     } catch (err) { const message = err instanceof Error ? err.message : String(err); setError(message); setStatus('error'); addLog(message); }
@@ -263,7 +294,7 @@ export default function ChromeFastApp() {
     </section>
     <section className="grid">
       <div className="panel"><h2>Microphone</h2><p>Active: {activeMic}</p><div className="meter"><div style={{ width: `${level}%` }} /></div><p>Mic level: {level}%</p></div>
-      <div className="panel"><h2>Voice gate</h2><p>Audio is sent above {VOICE_GATE}%. Log should show Audio chunks sent while you speak.</p></div>
+      <div className="panel"><h2>Diagnostics</h2><p>Look for: Gemini messages received, Input, Output, Gemini audio chunk received.</p></div>
     </section>
     <section className="grid"><div className="panel"><h2>Input speech</h2><p>{inputText || 'Input transcript will appear here.'}</p></div><div className="panel"><h2>Russian translation</h2><p>{outputText || 'Russian translation will appear here.'}</p></div></section>
     <section className="panel log-panel"><h2>Log</h2>{log.length ? <ul>{log.map((item, index) => <li key={index}>{item}</li>)}</ul> : <p>Log is empty.</p>}</section>
