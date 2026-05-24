@@ -4,43 +4,29 @@ export interface Env {
 }
 
 const GEMINI_WS_ENDPOINT = 'https://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
+const WORKER_VERSION = 'chrome-clean-1';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
     const url = new URL(request.url);
-    if (url.pathname === '/health') return Response.json({ ok: true, service: 'hebrew-russian-live-translator' });
+
+    if (url.pathname === '/health') {
+      return Response.json({ ok: true, service: 'hebrew-russian-live-translator', version: WORKER_VERSION });
+    }
+
+    if (url.pathname === '/debug') {
+      return Response.json({
+        ok: true,
+        version: WORKER_VERSION,
+        hasGeminiKey: Boolean(env.GEMINI_API_KEY),
+        geminiKeyLength: env.GEMINI_API_KEY ? env.GEMINI_API_KEY.length : 0
+      });
+    }
+
     if (url.pathname === '/ws') return handleWebSocketProxy(request, env);
     return env.ASSETS.fetch(request);
   }
 };
-
-function normalizeClientMessage(data: string | ArrayBuffer): string | ArrayBuffer {
-  if (typeof data !== 'string') return data;
-
-  try {
-    const message = JSON.parse(data) as Record<string, unknown>;
-    const maybeConfig = message.config;
-
-    if (maybeConfig && typeof maybeConfig === 'object') {
-      const config = maybeConfig as Record<string, unknown>;
-      return JSON.stringify({
-        setup: {
-          model: config.model,
-          generationConfig: {
-            responseModalities: config.responseModalities ?? ['AUDIO']
-          },
-          systemInstruction: config.systemInstruction,
-          inputAudioTranscription: config.inputAudioTranscription ?? {},
-          outputAudioTranscription: config.outputAudioTranscription ?? {}
-        }
-      });
-    }
-
-    return data;
-  } catch {
-    return data;
-  }
-}
 
 async function handleWebSocketProxy(request: Request, env: Env): Promise<Response> {
   if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
@@ -48,7 +34,6 @@ async function handleWebSocketProxy(request: Request, env: Env): Promise<Respons
   }
 
   if (!env.GEMINI_API_KEY) {
-    console.error('Missing GEMINI_API_KEY secret');
     return new Response('Missing GEMINI_API_KEY secret', { status: 500 });
   }
 
@@ -58,15 +43,13 @@ async function handleWebSocketProxy(request: Request, env: Env): Promise<Respons
       headers: { Upgrade: 'websocket' }
     });
   } catch (error) {
-    console.error('Upstream websocket fetch failed', error instanceof Error ? error.message : String(error));
-    return new Response('Upstream websocket fetch failed', { status: 502 });
+    return new Response(`Upstream websocket fetch failed: ${error instanceof Error ? error.message : String(error)}`, { status: 502 });
   }
 
   const upstreamSocket = upstreamResponse.webSocket;
   if (!upstreamSocket) {
     const body = await upstreamResponse.text().catch(() => '');
-    console.error('Upstream websocket handshake failed', upstreamResponse.status, body.slice(0, 500));
-    return new Response('Upstream websocket handshake failed', { status: 502 });
+    return new Response(`Upstream websocket handshake failed: ${upstreamResponse.status} ${body.slice(0, 500)}`, { status: 502 });
   }
 
   const pair = new WebSocketPair();
@@ -83,10 +66,9 @@ async function handleWebSocketProxy(request: Request, env: Env): Promise<Respons
 
   serverSocket.addEventListener('message', (event) => {
     try {
-      if (upstreamSocket.readyState === WebSocket.OPEN) upstreamSocket.send(normalizeClientMessage(event.data));
+      if (upstreamSocket.readyState === WebSocket.OPEN) upstreamSocket.send(event.data);
     } catch (error) {
-      console.error('client-to-upstream failed', error instanceof Error ? error.message : String(error));
-      closeBoth(1011, 'client-to-upstream failed');
+      closeBoth(1011, `client-to-upstream failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   });
 
@@ -94,8 +76,7 @@ async function handleWebSocketProxy(request: Request, env: Env): Promise<Respons
     try {
       if (serverSocket.readyState === WebSocket.OPEN) serverSocket.send(event.data);
     } catch (error) {
-      console.error('upstream-to-client failed', error instanceof Error ? error.message : String(error));
-      closeBoth(1011, 'upstream-to-client failed');
+      closeBoth(1011, `upstream-to-client failed: ${error instanceof Error ? error.message : String(error)}`);
     }
   });
 
