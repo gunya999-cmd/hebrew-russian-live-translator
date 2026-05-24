@@ -85,7 +85,6 @@ export default function App() {
       const outputs = devices.filter((device) => device.kind === 'audiooutput').map((device, index) => ({ deviceId: device.deviceId, label: device.label || `Speaker ${index + 1}` }));
       setAudioInputs(inputs);
       setAudioOutputs(outputs);
-      if (!selectedInputId && inputs[0]) setSelectedInputId(inputs[0].deviceId);
       addLog(`Devices found: ${inputs.length} mic input(s), ${outputs.length} audio output(s).`);
     } catch (error) {
       addLog(`Device refresh failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -308,7 +307,7 @@ export default function App() {
         <h2>Microphone</h2>
         <label className="field-label" htmlFor="mic-select">Input device</label>
         <select id="mic-select" value={selectedInputId} onChange={(event) => setSelectedInputId(event.target.value)} disabled={status === 'listening'}>
-          {audioInputs.length === 0 && <option value="">Default microphone</option>}
+          <option value="">Default microphone</option>
           {audioInputs.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label}</option>)}
         </select>
         <p>Active mic: {activeMicLabel}</p>
