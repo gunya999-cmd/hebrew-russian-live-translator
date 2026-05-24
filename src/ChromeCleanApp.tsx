@@ -1,5 +1,5 @@
-import ChromeFastApp from './ChromeFastApp';
+import BlobSafeApp from './BlobSafeApp';
 
 export default function ChromeCleanApp() {
-  return <ChromeFastApp />;
+  return <BlobSafeApp />;
 }
