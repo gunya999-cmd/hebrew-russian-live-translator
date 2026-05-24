@@ -18,6 +18,20 @@ function isAudioChunk(data: unknown): boolean {
   return typeof data === 'string' && data.includes('realtimeInput') && data.includes('audio') && !data.includes('audioStreamEnd');
 }
 
+function adaptOutgoingMessage(data: string | ArrayBufferLike | Blob | ArrayBufferView): string | ArrayBufferLike | Blob | ArrayBufferView {
+  if (typeof data !== 'string') return data;
+  try {
+    const msg = JSON.parse(data) as { realtimeInput?: { audio?: { data?: string; mimeType?: string }; mediaChunks?: unknown[]; audioStreamEnd?: boolean } };
+    const audio = msg.realtimeInput?.audio;
+    if (!audio) return data;
+    delete msg.realtimeInput!.audio;
+    msg.realtimeInput!.mediaChunks = [{ data: audio.data, mimeType: audio.mimeType }];
+    return JSON.stringify(msg);
+  } catch {
+    return data;
+  }
+}
+
 export default function BlobSafeApp() {
   const [ready, setReady] = useState(false);
 
@@ -40,7 +54,8 @@ export default function BlobSafeApp() {
       }
 
       send(data: string | ArrayBufferLike | Blob | ArrayBufferView): void {
-        super.send(data);
+        const outgoing = adaptOutgoingMessage(data);
+        super.send(outgoing);
         if (!isAudioChunk(data)) return;
         if (this.audioEndTimer !== null) window.clearTimeout(this.audioEndTimer);
         this.audioEndTimer = window.setTimeout(() => {
