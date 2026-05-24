@@ -67,6 +67,9 @@ export default function App() {
   const outRef = useRef<AudioBufferSourceNode[]>([]);
   const startedRef = useRef(false);
   const lastLevelUpdateRef = useRef(0);
+  const testStreamRef = useRef<MediaStream | null>(null);
+  const testCtxRef = useRef<AudioContext | null>(null);
+  const testRafRef = useRef<number | null>(null);
 
   const subtitle = useMemo(() => status === 'idle' ? 'Put on AirPods, place the iPhone near the speaker, then press start.' : status === 'listening' ? 'Listening to Hebrew and sending Russian voice translation to the iPhone audio output.' : status === 'connecting' ? 'Connecting to Cloudflare Worker and Gemini Live API...' : status === 'stopping' ? 'Stopping microphone...' : 'Startup error.', [status]);
   const addLog = (text: string) => setLog((items) => [`${new Date().toLocaleTimeString('ru-RU')} - ${text}`, ...items].slice(0, 12));
@@ -108,6 +111,56 @@ export default function App() {
     }
   }
 
+  function stopMicTest() {
+    if (testRafRef.current !== null) cancelAnimationFrame(testRafRef.current);
+    testRafRef.current = null;
+    testStreamRef.current?.getTracks().forEach((track) => track.stop());
+    testStreamRef.current = null;
+    void testCtxRef.current?.close();
+    testCtxRef.current = null;
+    setMicLevel(0);
+    setActiveMicLabel('not started');
+  }
+
+  async function testMicrophone() {
+    try {
+      stopMicTest();
+      const audioConstraints: MediaTrackConstraints = {
+        channelCount: 1,
+        echoCancellation: false,
+        noiseSuppression: false,
+        autoGainControl: false
+      };
+      if (selectedInputId) audioConstraints.deviceId = { exact: selectedInputId };
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints, video: false });
+      testStreamRef.current = stream;
+      const track = stream.getAudioTracks()[0];
+      setActiveMicLabel(track?.label || 'default microphone');
+      addLog(`Mic test track: ${track?.label || 'default microphone'}`);
+      await refreshDevices();
+
+      const ctx = new (getAudioContextCtor())({ latencyHint: 'interactive' });
+      testCtxRef.current = ctx;
+      await ctx.resume();
+      const source = ctx.createMediaStreamSource(stream);
+      const analyser = ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      source.connect(analyser);
+      const samples = new Float32Array(analyser.fftSize);
+      const tick = () => {
+        analyser.getFloatTimeDomainData(samples);
+        setMicLevel(rmsLevel(samples));
+        testRafRef.current = requestAnimationFrame(tick);
+      };
+      tick();
+      addLog('Standalone microphone test is running. Speak near iPhone and watch Mic level.');
+    } catch (error) {
+      setStatus('error');
+      setError(error instanceof Error ? error.message : 'Standalone microphone test failed.');
+      addLog(`Standalone microphone test failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
   function stopOutput() {
     for (const node of outRef.current) { try { node.stop(); } catch {} }
     outRef.current = [];
@@ -133,6 +186,7 @@ export default function App() {
   async function startMic() {
     if (startedRef.current) return;
     startedRef.current = true;
+    stopMicTest();
     const ctx = ctxRef.current;
     const ws = wsRef.current;
     if (!ctx || !ws || ws.readyState !== WebSocket.OPEN) return;
@@ -206,6 +260,7 @@ export default function App() {
   async function start() {
     setError(''); setInputText(''); setOutputText(''); setStatus('connecting'); startedRef.current = false; setMicLevel(0); addLog('Session started.');
     try {
+      stopMicTest();
       const ctx = new (getAudioContextCtor())({ latencyHint: 'interactive' });
       ctxRef.current = ctx;
       await ctx.resume();
@@ -221,6 +276,7 @@ export default function App() {
 
   async function stop() {
     setStatus('stopping'); addLog('Stopping.');
+    stopMicTest();
     stopOutput();
     try { micRef.current?.disconnect(); sourceRef.current?.disconnect(); } catch {}
     streamRef.current?.getTracks().forEach((t) => t.stop());
@@ -240,6 +296,8 @@ export default function App() {
         <button className="primary" disabled={status !== 'idle' && status !== 'error'} onClick={start}>Start translation</button>
         <button className="secondary" disabled={status === 'idle' || status === 'stopping'} onClick={() => void stop()}>Stop</button>
         <button className="secondary" onClick={() => void refreshDevices()}>Refresh devices</button>
+        <button className="secondary" onClick={() => void testMicrophone()}>Test microphone</button>
+        <button className="secondary" onClick={stopMicTest}>Stop mic test</button>
         <button className="secondary" onClick={() => void playTestTone()}>Test speaker</button>
       </div>
       <div className={`status-pill ${status}`}><span />{status}</div>
