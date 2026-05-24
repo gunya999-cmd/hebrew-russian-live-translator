@@ -4,7 +4,7 @@ export interface Env {
 }
 
 const GEMINI_WS_ENDPOINT = 'https://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
-const WORKER_VERSION = 'receiver-no-interruption-1';
+const WORKER_VERSION = 'receiver-text-first-1';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -25,7 +25,7 @@ function toGeminiSetup(data: string | ArrayBuffer): string | ArrayBuffer {
     return JSON.stringify({
       setup: {
         model: config.model,
-        generationConfig: { responseModalities: config.responseModalities ?? ['AUDIO'] },
+        generationConfig: { responseModalities: ['TEXT'] },
         systemInstruction: config.systemInstruction,
         realtimeInputConfig: {
           activityHandling: 'NO_INTERRUPTION',
