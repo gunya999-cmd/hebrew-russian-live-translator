@@ -4,7 +4,7 @@ export interface Env {
 }
 
 const GEMINI_WS_ENDPOINT = 'https://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
-const WORKER_VERSION = 'chrome-clean-4';
+const WORKER_VERSION = 'chrome-clean-5';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -31,6 +31,15 @@ function normalizeClientMessage(data: string | ArrayBuffer): string | ArrayBuffe
     if (!config || typeof config !== 'object') return data;
     return JSON.stringify({ setup: { model: config.model, generationConfig: { responseModalities: config.responseModalities ?? ['AUDIO'] }, systemInstruction: config.systemInstruction, inputAudioTranscription: config.inputAudioTranscription ?? {}, outputAudioTranscription: config.outputAudioTranscription ?? {} } });
   } catch { return data; }
+}
+
+function normalizeUpstreamMessage(data: string | ArrayBuffer): string | ArrayBuffer {
+  if (typeof data === 'string') return data;
+  try {
+    return new TextDecoder().decode(data);
+  } catch {
+    return data;
+  }
 }
 
 function clientNote(text: string): string {
@@ -100,9 +109,11 @@ async function handleWebSocketProxy(request: Request, env: Env): Promise<Respons
   upstreamSocket.addEventListener('message', (event) => {
     try {
       upstreamMessages += 1;
+      const normalized = normalizeUpstreamMessage(event.data);
       if (serverSocket.readyState === WebSocket.OPEN) {
         if (upstreamMessages === 1 || upstreamMessages % 10 === 0) serverSocket.send(clientNote(`worker: upstream messages ${upstreamMessages}`));
-        serverSocket.send(event.data);
+        if (typeof event.data !== 'string' && typeof normalized === 'string') serverSocket.send(clientNote('worker: decoded binary upstream message'));
+        serverSocket.send(normalized);
       }
     } catch (error) {
       closeBoth(1011, `upstream-to-client failed: ${error instanceof Error ? error.message : String(error)}`);
