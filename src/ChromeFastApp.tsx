@@ -70,15 +70,43 @@ export default function ChromeFastApp() {
 
   const addLog = (text: string) => setLog((items) => [`${new Date().toLocaleTimeString()} - ${text}`, ...items].slice(0, 12));
 
+  async function openMicStream(deviceId?: string): Promise<MediaStream> {
+    const audio: MediaTrackConstraints = { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false };
+    if (deviceId) audio.deviceId = { exact: deviceId };
+    return navigator.mediaDevices.getUserMedia({ audio, video: false });
+  }
+
   async function getIphoneMic(): Promise<MediaStream> {
-    const first = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: false, noiseSuppression: false, autoGainControl: false }, video: false });
-    const label = first.getAudioTracks()[0]?.label || 'iPhone microphone';
-    if (isAirPods(label)) {
-      first.getTracks().forEach((track) => track.stop());
-      throw new Error('Chrome selected AirPods as microphone. Disconnect AirPods, start listening, then choose AirPods as output in Control Center.');
+    const first = await openMicStream();
+    const firstLabel = first.getAudioTracks()[0]?.label || 'iPhone microphone';
+    if (!isAirPods(firstLabel)) {
+      setActiveMic(firstLabel);
+      return first;
     }
-    setActiveMic(label);
-    return first;
+
+    first.getTracks().forEach((track) => track.stop());
+    addLog('Chrome picked AirPods as mic. Searching for iPhone/non-AirPods input...');
+
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const candidates = devices.filter((device) => device.kind === 'audioinput' && !isAirPods(device.label));
+    addLog(`Non-AirPods mic candidates: ${candidates.length}.`);
+
+    for (const candidate of candidates) {
+      try {
+        const stream = await openMicStream(candidate.deviceId);
+        const label = stream.getAudioTracks()[0]?.label || candidate.label || 'iPhone microphone';
+        if (!isAirPods(label)) {
+          setActiveMic(label);
+          addLog(`Selected mic: ${label}.`);
+          return stream;
+        }
+        stream.getTracks().forEach((track) => track.stop());
+      } catch {
+        // Try next candidate.
+      }
+    }
+
+    throw new Error('Chrome still selected AirPods as microphone. Disconnect AirPods, press Start listening, then choose AirPods as output in Control Center.');
   }
 
   function stopOutput() {
