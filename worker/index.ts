@@ -4,7 +4,7 @@ export interface Env {
 }
 
 const GEMINI_WS_ENDPOINT = 'https://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
-const WORKER_VERSION = 'chrome-clean-2';
+const WORKER_VERSION = 'chrome-clean-4';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -31,6 +31,10 @@ function normalizeClientMessage(data: string | ArrayBuffer): string | ArrayBuffe
     if (!config || typeof config !== 'object') return data;
     return JSON.stringify({ setup: { model: config.model, generationConfig: { responseModalities: config.responseModalities ?? ['AUDIO'] }, systemInstruction: config.systemInstruction, inputAudioTranscription: config.inputAudioTranscription ?? {}, outputAudioTranscription: config.outputAudioTranscription ?? {} } });
   } catch { return data; }
+}
+
+function clientNote(text: string): string {
+  return JSON.stringify({ serverContent: { outputTranscription: { text } } });
 }
 
 async function handleWebSocketProxy(request: Request, env: Env): Promise<Response> {
@@ -62,6 +66,15 @@ async function handleWebSocketProxy(request: Request, env: Env): Promise<Respons
   serverSocket.accept();
   upstreamSocket.accept();
 
+  let clientAudioChunks = 0;
+  let upstreamMessages = 0;
+
+  const sendNote = (text: string) => {
+    try {
+      if (serverSocket.readyState === WebSocket.OPEN) serverSocket.send(clientNote(text));
+    } catch {}
+  };
+
   const closeBoth = (code = 1000, reason = 'closed') => {
     try { serverSocket.close(code, reason); } catch {}
     try { upstreamSocket.close(code, reason); } catch {}
@@ -69,7 +82,16 @@ async function handleWebSocketProxy(request: Request, env: Env): Promise<Respons
 
   serverSocket.addEventListener('message', (event) => {
     try {
-      if (upstreamSocket.readyState === WebSocket.OPEN) upstreamSocket.send(normalizeClientMessage(event.data));
+      const normalized = normalizeClientMessage(event.data);
+      if (upstreamSocket.readyState === WebSocket.OPEN) upstreamSocket.send(normalized);
+
+      const raw = typeof event.data === 'string' ? event.data : '';
+      const normalizedText = typeof normalized === 'string' ? normalized : '';
+      if (normalizedText.includes('"setup"')) sendNote('worker: setup forwarded to upstream');
+      if (raw.includes('realtimeInput')) {
+        clientAudioChunks += 1;
+        if (clientAudioChunks === 1 || clientAudioChunks % 50 === 0) sendNote(`worker: audio chunks forwarded ${clientAudioChunks}`);
+      }
     } catch (error) {
       closeBoth(1011, `client-to-upstream failed: ${error instanceof Error ? error.message : String(error)}`);
     }
@@ -77,7 +99,11 @@ async function handleWebSocketProxy(request: Request, env: Env): Promise<Respons
 
   upstreamSocket.addEventListener('message', (event) => {
     try {
-      if (serverSocket.readyState === WebSocket.OPEN) serverSocket.send(event.data);
+      upstreamMessages += 1;
+      if (serverSocket.readyState === WebSocket.OPEN) {
+        if (upstreamMessages === 1 || upstreamMessages % 10 === 0) serverSocket.send(clientNote(`worker: upstream messages ${upstreamMessages}`));
+        serverSocket.send(event.data);
+      }
     } catch (error) {
       closeBoth(1011, `upstream-to-client failed: ${error instanceof Error ? error.message : String(error)}`);
     }
