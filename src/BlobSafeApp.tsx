@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react';
 import ChromeFastApp from './ChromeFastApp';
 
 const NativeWebSocket = window.WebSocket;
+const AUDIO_END_DELAY_MS = 1800;
 
 async function normalizeMessageData(data: unknown): Promise<unknown> {
   if (typeof data === 'string') return data;
@@ -13,12 +14,17 @@ async function normalizeMessageData(data: unknown): Promise<unknown> {
   return data;
 }
 
+function isAudioChunk(data: unknown): boolean {
+  return typeof data === 'string' && data.includes('realtimeInput') && data.includes('audio') && !data.includes('audioStreamEnd');
+}
+
 export default function BlobSafeApp() {
   const [ready, setReady] = useState(false);
 
   useEffect(() => {
     class BlobSafeWebSocket extends NativeWebSocket {
       private wrappedHandler: ((this: WebSocket, ev: MessageEvent) => unknown) | null = null;
+      private audioEndTimer: number | null = null;
 
       set onmessage(handler: ((this: WebSocket, ev: MessageEvent) => unknown) | null) {
         this.wrappedHandler = handler;
@@ -31,6 +37,24 @@ export default function BlobSafeApp() {
 
       get onmessage() {
         return this.wrappedHandler;
+      }
+
+      send(data: string | ArrayBufferLike | Blob | ArrayBufferView): void {
+        super.send(data);
+        if (!isAudioChunk(data)) return;
+        if (this.audioEndTimer !== null) window.clearTimeout(this.audioEndTimer);
+        this.audioEndTimer = window.setTimeout(() => {
+          if (this.readyState === NativeWebSocket.OPEN) {
+            super.send(JSON.stringify({ realtimeInput: { audioStreamEnd: true } }));
+          }
+          this.audioEndTimer = null;
+        }, AUDIO_END_DELAY_MS);
+      }
+
+      close(code?: number, reason?: string): void {
+        if (this.audioEndTimer !== null) window.clearTimeout(this.audioEndTimer);
+        this.audioEndTimer = null;
+        super.close(code, reason);
       }
     }
 
