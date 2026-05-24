@@ -4,7 +4,7 @@ export interface Env {
 }
 
 const GEMINI_WS_ENDPOINT = 'https://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
-const WORKER_VERSION = 'chrome-clean-1';
+const WORKER_VERSION = 'chrome-clean-2';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -15,18 +15,23 @@ export default {
     }
 
     if (url.pathname === '/debug') {
-      return Response.json({
-        ok: true,
-        version: WORKER_VERSION,
-        hasGeminiKey: Boolean(env.GEMINI_API_KEY),
-        geminiKeyLength: env.GEMINI_API_KEY ? env.GEMINI_API_KEY.length : 0
-      });
+      return Response.json({ ok: true, version: WORKER_VERSION, hasGeminiKey: Boolean(env.GEMINI_API_KEY), geminiKeyLength: env.GEMINI_API_KEY ? env.GEMINI_API_KEY.length : 0 });
     }
 
     if (url.pathname === '/ws') return handleWebSocketProxy(request, env);
     return env.ASSETS.fetch(request);
   }
 };
+
+function normalizeClientMessage(data: string | ArrayBuffer): string | ArrayBuffer {
+  if (typeof data !== 'string') return data;
+  try {
+    const message = JSON.parse(data) as Record<string, unknown>;
+    const config = message.config as Record<string, unknown> | undefined;
+    if (!config || typeof config !== 'object') return data;
+    return JSON.stringify({ setup: { model: config.model, generationConfig: { responseModalities: config.responseModalities ?? ['AUDIO'] }, systemInstruction: config.systemInstruction, inputAudioTranscription: config.inputAudioTranscription ?? {}, outputAudioTranscription: config.outputAudioTranscription ?? {} } });
+  } catch { return data; }
+}
 
 async function handleWebSocketProxy(request: Request, env: Env): Promise<Response> {
   if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
@@ -39,9 +44,7 @@ async function handleWebSocketProxy(request: Request, env: Env): Promise<Respons
 
   let upstreamResponse: Response;
   try {
-    upstreamResponse = await fetch(`${GEMINI_WS_ENDPOINT}?key=${encodeURIComponent(env.GEMINI_API_KEY)}`, {
-      headers: { Upgrade: 'websocket' }
-    });
+    upstreamResponse = await fetch(`${GEMINI_WS_ENDPOINT}?key=${encodeURIComponent(env.GEMINI_API_KEY)}`, { headers: { Upgrade: 'websocket' } });
   } catch (error) {
     return new Response(`Upstream websocket fetch failed: ${error instanceof Error ? error.message : String(error)}`, { status: 502 });
   }
@@ -66,7 +69,7 @@ async function handleWebSocketProxy(request: Request, env: Env): Promise<Respons
 
   serverSocket.addEventListener('message', (event) => {
     try {
-      if (upstreamSocket.readyState === WebSocket.OPEN) upstreamSocket.send(event.data);
+      if (upstreamSocket.readyState === WebSocket.OPEN) upstreamSocket.send(normalizeClientMessage(event.data));
     } catch (error) {
       closeBoth(1011, `client-to-upstream failed: ${error instanceof Error ? error.message : String(error)}`);
     }
