@@ -3,7 +3,7 @@ export interface Env {
   ASSETS: Fetcher;
 }
 
-const GEMINI_WS_ENDPOINT = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
+const GEMINI_WS_ENDPOINT = 'https://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -15,23 +15,37 @@ export default {
 };
 
 async function handleWebSocketProxy(request: Request, env: Env): Promise<Response> {
-  if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') return new Response('Expected WebSocket upgrade', { status: 426 });
-  if (!env.GEMINI_API_KEY) return new Response('Missing GEMINI_API_KEY secret', { status: 500 });
+  if (request.headers.get('Upgrade')?.toLowerCase() !== 'websocket') {
+    return new Response('Expected WebSocket upgrade', { status: 426 });
+  }
+
+  if (!env.GEMINI_API_KEY) {
+    console.error('Missing GEMINI_API_KEY secret');
+    return new Response('Missing GEMINI_API_KEY secret', { status: 500 });
+  }
+
+  let upstreamResponse: Response;
+  try {
+    upstreamResponse = await fetch(`${GEMINI_WS_ENDPOINT}?key=${encodeURIComponent(env.GEMINI_API_KEY)}`, {
+      headers: { Upgrade: 'websocket' }
+    });
+  } catch (error) {
+    console.error('Upstream websocket fetch failed', error instanceof Error ? error.message : String(error));
+    return new Response('Upstream websocket fetch failed', { status: 502 });
+  }
+
+  const upstreamSocket = upstreamResponse.webSocket;
+  if (!upstreamSocket) {
+    const body = await upstreamResponse.text().catch(() => '');
+    console.error('Upstream websocket handshake failed', upstreamResponse.status, body.slice(0, 500));
+    return new Response('Upstream websocket handshake failed', { status: 502 });
+  }
 
   const pair = new WebSocketPair();
   const clientSocket = pair[0];
   const serverSocket = pair[1];
+
   serverSocket.accept();
-
-  const upstreamResponse = await fetch(`${GEMINI_WS_ENDPOINT}?key=${encodeURIComponent(env.GEMINI_API_KEY)}`, {
-    headers: { Upgrade: 'websocket', 'x-goog-api-key': env.GEMINI_API_KEY }
-  });
-
-  const upstreamSocket = upstreamResponse.webSocket;
-  if (!upstreamSocket) {
-    serverSocket.close(1011, 'Gemini websocket handshake failed');
-    return new Response('Gemini websocket handshake failed', { status: 502 });
-  }
   upstreamSocket.accept();
 
   const closeBoth = (code = 1000, reason = 'closed') => {
@@ -39,8 +53,24 @@ async function handleWebSocketProxy(request: Request, env: Env): Promise<Respons
     try { upstreamSocket.close(code, reason); } catch {}
   };
 
-  serverSocket.addEventListener('message', (event) => { try { if (upstreamSocket.readyState === WebSocket.OPEN) upstreamSocket.send(event.data); } catch { closeBoth(1011, 'client-to-upstream failed'); } });
-  upstreamSocket.addEventListener('message', (event) => { try { if (serverSocket.readyState === WebSocket.OPEN) serverSocket.send(event.data); } catch { closeBoth(1011, 'upstream-to-client failed'); } });
+  serverSocket.addEventListener('message', (event) => {
+    try {
+      if (upstreamSocket.readyState === WebSocket.OPEN) upstreamSocket.send(event.data);
+    } catch (error) {
+      console.error('client-to-upstream failed', error instanceof Error ? error.message : String(error));
+      closeBoth(1011, 'client-to-upstream failed');
+    }
+  });
+
+  upstreamSocket.addEventListener('message', (event) => {
+    try {
+      if (serverSocket.readyState === WebSocket.OPEN) serverSocket.send(event.data);
+    } catch (error) {
+      console.error('upstream-to-client failed', error instanceof Error ? error.message : String(error));
+      closeBoth(1011, 'upstream-to-client failed');
+    }
+  });
+
   serverSocket.addEventListener('close', (event) => closeBoth(event.code, event.reason));
   upstreamSocket.addEventListener('close', (event) => closeBoth(event.code, event.reason));
   serverSocket.addEventListener('error', () => closeBoth(1011, 'client socket error'));
