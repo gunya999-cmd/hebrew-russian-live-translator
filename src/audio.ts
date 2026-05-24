@@ -1,8 +1,8 @@
 export const INPUT_SAMPLE_RATE = 16000;
 export const DEFAULT_OUTPUT_SAMPLE_RATE = 24000;
 
-export function downsampleBuffer(input: Float32Array<ArrayBufferLike>, inputRate: number, outputRate: number): Float32Array<ArrayBuffer> {
-  if (outputRate === inputRate) return new Float32Array(input);
+export function downsampleBuffer(input: Float32Array<ArrayBufferLike>, inputRate: number, outputRate: number): Float32Array<ArrayBufferLike> {
+  if (outputRate === inputRate) return input;
   if (outputRate > inputRate) throw new Error(`Output sample rate ${outputRate} cannot be higher than input sample rate ${inputRate}`);
   const ratio = inputRate / outputRate;
   const newLength = Math.round(input.length / ratio);
@@ -21,7 +21,7 @@ export function downsampleBuffer(input: Float32Array<ArrayBufferLike>, inputRate
   return result;
 }
 
-export function floatTo16BitPCM(input: Float32Array<ArrayBufferLike>): Int16Array {
+export function floatTo16BitPCM(input: Float32Array<ArrayBufferLike>): Int16Array<ArrayBufferLike> {
   const output = new Int16Array(input.length);
   for (let i = 0; i < input.length; i += 1) {
     const s = Math.max(-1, Math.min(1, input[i]));
@@ -36,7 +36,7 @@ export function int16ToFloat32(input: Int16Array<ArrayBufferLike>): Float32Array
   return output;
 }
 
-export function arrayBufferToBase64(buffer: ArrayBuffer): string {
+export function arrayBufferToBase64(buffer: ArrayBufferLike): string {
   const bytes = new Uint8Array(buffer);
   let binary = '';
   const chunkSize = 0x8000;
@@ -44,7 +44,7 @@ export function arrayBufferToBase64(buffer: ArrayBuffer): string {
   return btoa(binary);
 }
 
-export function base64ToInt16Array(base64: string): Int16Array {
+export function base64ToInt16Array(base64: string): Int16Array<ArrayBuffer> {
   const binary = atob(base64);
   const bytes = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
