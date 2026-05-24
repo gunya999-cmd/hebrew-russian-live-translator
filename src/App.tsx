@@ -4,6 +4,7 @@ import { INPUT_SAMPLE_RATE, arrayBufferToBase64, base64ToInt16Array, downsampleB
 type Status = 'idle' | 'connecting' | 'listening' | 'stopping' | 'error';
 type GeminiPart = { inlineData?: { mimeType?: string; data?: string }; text?: string };
 type GeminiServerMessage = { setupComplete?: object; serverContent?: { interrupted?: boolean; inputTranscription?: { text?: string }; outputTranscription?: { text?: string }; modelTurn?: { parts?: GeminiPart[] } }; goAway?: object };
+type DeviceOption = { deviceId: string; label: string };
 
 const WS_URL = import.meta.env.VITE_WS_URL || `${location.protocol === 'https:' ? 'wss' : 'ws'}://${location.host}/ws`;
 
@@ -36,12 +37,27 @@ function setupMessage() {
   };
 }
 
+function getAudioContextCtor(): typeof AudioContext {
+  return window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
+}
+
+function rmsLevel(samples: Float32Array<ArrayBufferLike>): number {
+  let sum = 0;
+  for (let i = 0; i < samples.length; i += 1) sum += samples[i] * samples[i];
+  return Math.min(100, Math.round(Math.sqrt(sum / Math.max(1, samples.length)) * 240));
+}
+
 export default function App() {
   const [status, setStatus] = useState<Status>('idle');
   const [error, setError] = useState('');
   const [inputText, setInputText] = useState('');
   const [outputText, setOutputText] = useState('');
   const [log, setLog] = useState<string[]>([]);
+  const [audioInputs, setAudioInputs] = useState<DeviceOption[]>([]);
+  const [audioOutputs, setAudioOutputs] = useState<DeviceOption[]>([]);
+  const [selectedInputId, setSelectedInputId] = useState('');
+  const [activeMicLabel, setActiveMicLabel] = useState('not started');
+  const [micLevel, setMicLevel] = useState(0);
   const wsRef = useRef<WebSocket | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const ctxRef = useRef<AudioContext | null>(null);
@@ -50,9 +66,47 @@ export default function App() {
   const playAtRef = useRef(0);
   const outRef = useRef<AudioBufferSourceNode[]>([]);
   const startedRef = useRef(false);
+  const lastLevelUpdateRef = useRef(0);
 
   const subtitle = useMemo(() => status === 'idle' ? 'Put on AirPods, place the iPhone near the speaker, then press start.' : status === 'listening' ? 'Listening to Hebrew and sending Russian voice translation to the iPhone audio output.' : status === 'connecting' ? 'Connecting to Cloudflare Worker and Gemini Live API...' : status === 'stopping' ? 'Stopping microphone...' : 'Startup error.', [status]);
-  const addLog = (text: string) => setLog((items) => [`${new Date().toLocaleTimeString('ru-RU')} - ${text}`, ...items].slice(0, 8));
+  const addLog = (text: string) => setLog((items) => [`${new Date().toLocaleTimeString('ru-RU')} - ${text}`, ...items].slice(0, 12));
+
+  async function refreshDevices() {
+    try {
+      if (!navigator.mediaDevices?.enumerateDevices) {
+        addLog('Device enumeration is not supported by this browser.');
+        return;
+      }
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const inputs = devices.filter((device) => device.kind === 'audioinput').map((device, index) => ({ deviceId: device.deviceId, label: device.label || `Microphone ${index + 1}` }));
+      const outputs = devices.filter((device) => device.kind === 'audiooutput').map((device, index) => ({ deviceId: device.deviceId, label: device.label || `Speaker ${index + 1}` }));
+      setAudioInputs(inputs);
+      setAudioOutputs(outputs);
+      if (!selectedInputId && inputs[0]) setSelectedInputId(inputs[0].deviceId);
+      addLog(`Devices found: ${inputs.length} mic input(s), ${outputs.length} audio output(s).`);
+    } catch (error) {
+      addLog(`Device refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
+
+  async function playTestTone() {
+    try {
+      const ctx = new (getAudioContextCtor())({ latencyHint: 'interactive' });
+      await ctx.resume();
+      const oscillator = ctx.createOscillator();
+      const gain = ctx.createGain();
+      oscillator.frequency.value = 880;
+      gain.gain.value = 0.08;
+      oscillator.connect(gain);
+      gain.connect(ctx.destination);
+      oscillator.start();
+      oscillator.stop(ctx.currentTime + 0.35);
+      oscillator.onended = () => void ctx.close();
+      addLog('Speaker test tone played. Check iPhone audio output / AirPods.');
+    } catch (error) {
+      addLog(`Speaker test failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  }
 
   function stopOutput() {
     for (const node of outRef.current) { try { node.stop(); } catch {} }
@@ -82,28 +136,56 @@ export default function App() {
     const ctx = ctxRef.current;
     const ws = wsRef.current;
     if (!ctx || !ws || ws.readyState !== WebSocket.OPEN) return;
-    const stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true, autoGainControl: true }, video: false });
-    streamRef.current = stream;
-    await ctx.audioWorklet.addModule('/mic-worklet.js');
-    const source = ctx.createMediaStreamSource(stream);
-    const mic = new AudioWorkletNode(ctx, 'mic-processor');
-    const muted = ctx.createGain();
-    muted.gain.value = 0;
-    mic.port.onmessage = (event: MessageEvent<Float32Array<ArrayBufferLike>>) => {
-      const socket = wsRef.current;
-      const audioCtx = ctxRef.current;
-      if (!socket || socket.readyState !== WebSocket.OPEN || !audioCtx) return;
-      const downsampled = downsampleBuffer(event.data, audioCtx.sampleRate, INPUT_SAMPLE_RATE);
-      const pcm16 = floatTo16BitPCM(downsampled);
-      socket.send(JSON.stringify({ realtimeInput: { audio: { mimeType: `audio/pcm;rate=${INPUT_SAMPLE_RATE}`, data: arrayBufferToBase64(pcm16.buffer as ArrayBuffer) } } }));
-    };
-    source.connect(mic);
-    mic.connect(muted);
-    muted.connect(ctx.destination);
-    sourceRef.current = source;
-    micRef.current = mic;
-    setStatus('listening');
-    addLog('Microphone enabled.');
+
+    try {
+      const audioConstraints: MediaTrackConstraints = {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true
+      };
+      if (selectedInputId) audioConstraints.deviceId = { exact: selectedInputId };
+
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: audioConstraints, video: false });
+      streamRef.current = stream;
+      const track = stream.getAudioTracks()[0];
+      setActiveMicLabel(track?.label || 'default microphone');
+      addLog(`Microphone track: ${track?.label || 'default microphone'}`);
+      await refreshDevices();
+
+      await ctx.audioWorklet.addModule('/mic-worklet.js');
+      const source = ctx.createMediaStreamSource(stream);
+      const mic = new AudioWorkletNode(ctx, 'mic-processor');
+      const muted = ctx.createGain();
+      muted.gain.value = 0;
+
+      mic.port.onmessage = (event: MessageEvent<Float32Array<ArrayBufferLike>>) => {
+        const socket = wsRef.current;
+        const audioCtx = ctxRef.current;
+        const now = performance.now();
+        if (now - lastLevelUpdateRef.current > 120) {
+          lastLevelUpdateRef.current = now;
+          setMicLevel(rmsLevel(event.data));
+        }
+        if (!socket || socket.readyState !== WebSocket.OPEN || !audioCtx) return;
+        const downsampled = downsampleBuffer(event.data, audioCtx.sampleRate, INPUT_SAMPLE_RATE);
+        const pcm16 = floatTo16BitPCM(downsampled);
+        socket.send(JSON.stringify({ realtimeInput: { audio: { mimeType: `audio/pcm;rate=${INPUT_SAMPLE_RATE}`, data: arrayBufferToBase64(pcm16.buffer as ArrayBuffer) } } }));
+      };
+
+      source.connect(mic);
+      mic.connect(muted);
+      muted.connect(ctx.destination);
+      sourceRef.current = source;
+      micRef.current = mic;
+      setStatus('listening');
+      addLog('Microphone enabled. Speak Hebrew and watch Mic level.');
+    } catch (error) {
+      startedRef.current = false;
+      setStatus('error');
+      setError(error instanceof Error ? error.message : 'Microphone start failed.');
+      addLog(`Microphone start failed: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
 
   function onMessage(raw: MessageEvent) {
@@ -122,15 +204,15 @@ export default function App() {
   }
 
   async function start() {
-    setError(''); setInputText(''); setOutputText(''); setStatus('connecting'); startedRef.current = false; addLog('Session started.');
+    setError(''); setInputText(''); setOutputText(''); setStatus('connecting'); startedRef.current = false; setMicLevel(0); addLog('Session started.');
     try {
-      const AudioContextCtor = window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
-      const ctx = new AudioContextCtor({ latencyHint: 'interactive' });
+      const ctx = new (getAudioContextCtor())({ latencyHint: 'interactive' });
       ctxRef.current = ctx;
       await ctx.resume();
+      await refreshDevices();
       const ws = new WebSocket(WS_URL);
       wsRef.current = ws;
-      ws.onopen = () => ws.send(JSON.stringify(setupMessage()));
+      ws.onopen = () => { addLog('WebSocket open. Sending Gemini setup.'); ws.send(JSON.stringify(setupMessage())); };
       ws.onmessage = onMessage;
       ws.onerror = () => { setStatus('error'); setError('WebSocket error. Check Cloudflare Worker, GEMINI_API_KEY, and Gemini Live model access.'); };
       ws.onclose = (event) => { if (status !== 'stopping') addLog(`WebSocket closed ${event.code || ''} ${event.reason || ''}`.trim()); };
@@ -144,9 +226,49 @@ export default function App() {
     streamRef.current?.getTracks().forEach((t) => t.stop());
     wsRef.current?.close();
     await ctxRef.current?.close();
-    wsRef.current = null; streamRef.current = null; ctxRef.current = null; micRef.current = null; sourceRef.current = null; playAtRef.current = 0; startedRef.current = false;
+    wsRef.current = null; streamRef.current = null; ctxRef.current = null; micRef.current = null; sourceRef.current = null; playAtRef.current = 0; startedRef.current = false; setMicLevel(0); setActiveMicLabel('not started');
     setStatus('idle');
   }
 
-  return <main className="app-shell"><section className="hero-card"><div className="eyebrow">Hebrew to Russian - Live Audio</div><h1>Hebrew to Russian voice translation in your headphones</h1><p className="subtitle">{subtitle}</p>{error && <div className="error">{error}</div>}<div className="controls"><button className="primary" disabled={status !== 'idle' && status !== 'error'} onClick={start}>Start translation</button><button className="secondary" disabled={status === 'idle' || status === 'stopping'} onClick={() => void stop()}>Stop</button></div><div className={`status-pill ${status}`}><span />{status}</div></section><section className="grid"><div className="panel"><h2>Input speech</h2><p>{inputText || 'Input transcript will appear here.'}</p></div><div className="panel"><h2>Russian translation</h2><p>{outputText || 'The main result is played as voice in your headphones.'}</p></div></section><section className="panel log-panel"><h2>Log</h2>{log.length ? <ul>{log.map((item, i) => <li key={i}>{item}</li>)}</ul> : <p>Log is empty.</p>}</section></main>;
+  return <main className="app-shell">
+    <section className="hero-card">
+      <div className="eyebrow">Hebrew to Russian - Live Audio</div>
+      <h1>Hebrew to Russian voice translation in your headphones</h1>
+      <p className="subtitle">{subtitle}</p>
+      {error && <div className="error">{error}</div>}
+      <div className="controls">
+        <button className="primary" disabled={status !== 'idle' && status !== 'error'} onClick={start}>Start translation</button>
+        <button className="secondary" disabled={status === 'idle' || status === 'stopping'} onClick={() => void stop()}>Stop</button>
+        <button className="secondary" onClick={() => void refreshDevices()}>Refresh devices</button>
+        <button className="secondary" onClick={() => void playTestTone()}>Test speaker</button>
+      </div>
+      <div className={`status-pill ${status}`}><span />{status}</div>
+    </section>
+
+    <section className="grid">
+      <div className="panel">
+        <h2>Microphone</h2>
+        <label className="field-label" htmlFor="mic-select">Input device</label>
+        <select id="mic-select" value={selectedInputId} onChange={(event) => setSelectedInputId(event.target.value)} disabled={status === 'listening'}>
+          {audioInputs.length === 0 && <option value="">Default microphone</option>}
+          {audioInputs.map((device) => <option key={device.deviceId} value={device.deviceId}>{device.label}</option>)}
+        </select>
+        <p>Active mic: {activeMicLabel}</p>
+        <div className="meter"><div style={{ width: `${micLevel}%` }} /></div>
+        <p>Mic level: {micLevel}%</p>
+      </div>
+      <div className="panel">
+        <h2>Headphones / speaker</h2>
+        <p>Audio output is controlled by iPhone / browser. Use iOS Control Center to choose AirPods before pressing Start.</p>
+        <p>Detected outputs: {audioOutputs.length || 'browser does not expose outputs'}</p>
+      </div>
+    </section>
+
+    <section className="grid">
+      <div className="panel"><h2>Input speech</h2><p>{inputText || 'Input transcript will appear here.'}</p></div>
+      <div className="panel"><h2>Russian translation</h2><p>{outputText || 'The main result is played as voice in your headphones.'}</p></div>
+    </section>
+
+    <section className="panel log-panel"><h2>Log</h2>{log.length ? <ul>{log.map((item, i) => <li key={i}>{item}</li>)}</ul> : <p>Log is empty.</p>}</section>
+  </main>;
 }
