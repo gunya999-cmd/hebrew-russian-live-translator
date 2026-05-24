@@ -4,7 +4,7 @@ export interface Env {
 }
 
 const GEMINI_WS_ENDPOINT = 'https://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContent';
-const WORKER_VERSION = 'chrome-clean-5';
+const WORKER_VERSION = 'chrome-clean-6';
 
 export default {
   async fetch(request: Request, env: Env): Promise<Response> {
@@ -33,13 +33,16 @@ function normalizeClientMessage(data: string | ArrayBuffer): string | ArrayBuffe
   } catch { return data; }
 }
 
-function normalizeUpstreamMessage(data: string | ArrayBuffer): string | ArrayBuffer {
+async function normalizeUpstreamMessage(data: unknown): Promise<string | ArrayBuffer> {
   if (typeof data === 'string') return data;
   try {
-    return new TextDecoder().decode(data);
-  } catch {
-    return data;
-  }
+    if (data instanceof ArrayBuffer) return new TextDecoder().decode(data);
+    if (ArrayBuffer.isView(data)) return new TextDecoder().decode(data.buffer);
+    const maybeBlob = data as { text?: () => Promise<string>; arrayBuffer?: () => Promise<ArrayBuffer> };
+    if (maybeBlob && typeof maybeBlob.text === 'function') return await maybeBlob.text();
+    if (maybeBlob && typeof maybeBlob.arrayBuffer === 'function') return new TextDecoder().decode(await maybeBlob.arrayBuffer());
+  } catch {}
+  return String(data);
 }
 
 function clientNote(text: string): string {
@@ -106,13 +109,13 @@ async function handleWebSocketProxy(request: Request, env: Env): Promise<Respons
     }
   });
 
-  upstreamSocket.addEventListener('message', (event) => {
+  upstreamSocket.addEventListener('message', async (event) => {
     try {
       upstreamMessages += 1;
-      const normalized = normalizeUpstreamMessage(event.data);
+      const normalized = await normalizeUpstreamMessage(event.data);
       if (serverSocket.readyState === WebSocket.OPEN) {
         if (upstreamMessages === 1 || upstreamMessages % 10 === 0) serverSocket.send(clientNote(`worker: upstream messages ${upstreamMessages}`));
-        if (typeof event.data !== 'string' && typeof normalized === 'string') serverSocket.send(clientNote('worker: decoded binary upstream message'));
+        if (typeof event.data !== 'string' && typeof normalized === 'string') serverSocket.send(clientNote('worker: decoded binary/blob upstream message'));
         serverSocket.send(normalized);
       }
     } catch (error) {
