@@ -34,8 +34,8 @@ const PASS_URL = '/ws-pass';
 const MODEL = 'models/gemini-3.1-flash-live-preview';
 const GAIN = 12;
 const LEVEL_SCALE = 2600;
-const SEGMENT_MS = 450;
-const MIN_CHUNKS = 5;
+const SEGMENT_MS = 300;
+const MIN_CHUNKS = 3;
 const MAX_TEXT = 900;
 
 const isAirPods = (label = '') => label.toLowerCase().includes('airpods');
@@ -67,7 +67,7 @@ function append(base: string, chunk: string): string {
   const text = chunk.trim();
   if (!text) return base;
   if (!base) return text;
-  return /^[,.;:!?…)]/.test(text) ? `${base}${text}` : `${base} ${text}`;
+  return /^[,.;:!?вЂ¦)]/.test(text) ? `${base}${text}` : `${base} ${text}`;
 }
 
 function trim(text: string): string {
@@ -136,7 +136,7 @@ function setupMessage() {
       generationConfig: { responseModalities: ['AUDIO'] },
       systemInstruction: {
         parts: [{
-          text: 'You are a one-way live interpreter. Translate only Hebrew speech from an external source into natural spoken Russian. Start Russian audio as soon as you understand a short fragment. Ignore Russian speech, user speech, background noise, and non-Hebrew audio. Do not answer questions. Do not explain.'
+          text: 'You are a one-way live interpreter. Translate only Hebrew speech from an external source into natural spoken Russian. Start Russian audio immediately after the first meaningful Hebrew phrase. Use very short Russian chunks. Do not wait for a full sentence or monologue. Ignore Russian speech, user speech, background noise, and non-Hebrew audio. Do not answer questions. Do not explain.'
         }]
       },
       realtimeInputConfig: {
@@ -467,7 +467,7 @@ export default function ReceiverApp() {
   return <main className="app-shell">
     <section className="hero-card">
       <div className="eyebrow">Gemini direct receiver</div>
-      <h1>Hebrew source → Russian in AirPods</h1>
+      <h1>Hebrew source в†’ Russian in AirPods</h1>
       <p className="subtitle">
         Direct client-to-Gemini mode. Cloudflare only creates a short pass; audio bypasses the Worker proxy.
       </p>
