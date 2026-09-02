@@ -2,6 +2,7 @@ import { useRef, useState } from 'react';
 import { INPUT_SAMPLE_RATE, arrayBufferToBase64, base64ToInt16Array, downsampleBuffer, floatTo16BitPCM, int16ToFloat32, parseSampleRateFromMimeType } from './audio';
 
 type Status = 'idle' | 'connecting' | 'receiving' | 'error';
+type AsrMode = 'quality' | 'fast';
 type Inline = { data?: string; mimeType?: string; mime_type?: string };
 type Part = { text?: string; inlineData?: Inline; inline_data?: Inline };
 type Msg = {
@@ -32,11 +33,34 @@ declare global {
 
 const PASS_URL = '/ws-pass';
 const MODEL = 'models/gemini-3.1-flash-live-preview';
-const GAIN = 12;
 const LEVEL_SCALE = 2600;
-const SEGMENT_MS = 300;
-const MIN_CHUNKS = 3;
-const MAX_TEXT = 900;
+const MAX_TEXT = 1200;
+
+const ASR_SETTINGS: Record<AsrMode, {
+  title: string;
+  gain: number;
+  prefixPaddingMs: number;
+  silenceDurationMs: number;
+  forcedSegmentMs: number;
+  note: string;
+}> = {
+  quality: {
+    title: 'Quality Hebrew ASR',
+    gain: 2.4,
+    prefixPaddingMs: 100,
+    silenceDurationMs: 650,
+    forcedSegmentMs: 0,
+    note: 'Лучше распознаёт беглый иврит: серверный VAD сам закрывает фразы, без разрезания слов каждые 300 мс.'
+  },
+  fast: {
+    title: 'Fast live mode',
+    gain: 3.2,
+    prefixPaddingMs: 60,
+    silenceDurationMs: 420,
+    forcedSegmentMs: 1200,
+    note: 'Быстрее реагирует, но может чаще ошибаться на иврите.'
+  }
+};
 
 const isAirPods = (label = '') => label.toLowerCase().includes('airpods');
 const wait = (ms: number) => new Promise((resolve) => window.setTimeout(resolve, ms));
@@ -67,7 +91,7 @@ function append(base: string, chunk: string): string {
   const text = chunk.trim();
   if (!text) return base;
   if (!base) return text;
-  return /^[,.;:!?вЂ¦)]/.test(text) ? `${base}${text}` : `${base} ${text}`;
+  return /^[,.;:!?…)]/u.test(text) ? `${base}${text}` : `${base} ${text}`;
 }
 
 function trim(text: string): string {
@@ -80,9 +104,13 @@ function level(samples: Float32Array): number {
   return Math.min(100, Math.round(Math.sqrt(sum / Math.max(1, samples.length)) * LEVEL_SCALE));
 }
 
-function boost(samples: Float32Array): Float32Array {
+function boost(samples: Float32Array, gain: number): Float32Array {
   const out = new Float32Array(samples.length);
-  for (let i = 0; i < samples.length; i += 1) out[i] = Math.max(-1, Math.min(1, samples[i] * GAIN));
+
+  for (let i = 0; i < samples.length; i += 1) {
+    out[i] = Math.tanh(samples[i] * gain);
+  }
+
   return out;
 }
 
@@ -129,14 +157,27 @@ async function openInputMic(log: (s: string) => void): Promise<MediaStream> {
   throw new Error('Input is still AirPods mic. Disconnect AirPods, press Start, then reconnect/select AirPods as output.');
 }
 
-function setupMessage() {
+function setupMessage(mode: AsrMode) {
+  const settings = ASR_SETTINGS[mode];
+
   return {
     setup: {
       model: MODEL,
-      generationConfig: { responseModalities: ['AUDIO'] },
+      generationConfig: {
+        responseModalities: ['AUDIO'],
+        temperature: 0.15
+      },
       systemInstruction: {
         parts: [{
-          text: 'You are a one-way live interpreter. Translate only Hebrew speech from an external source into natural spoken Russian. Start Russian audio immediately after the first meaningful Hebrew phrase. Use very short Russian chunks. Do not wait for a full sentence or monologue. Ignore Russian speech, user speech, background noise, and non-Hebrew audio. Do not answer questions. Do not explain.'
+          text: [
+            'You are a one-way live interpreter.',
+            'The source language is Israeli Hebrew only. Treat ambiguous short sounds as Hebrew, not Arabic, Russian, or English.',
+            'Translate Hebrew speech from an external speaker into natural spoken Russian.',
+            'Start Russian audio after the first meaningful Hebrew phrase, but do not invent missing words.',
+            'Use short Russian chunks suitable for an earpiece.',
+            'Do not answer questions. Do not explain. Do not add commentary.',
+            'Ignore user Russian speech, background noise, and non-Hebrew audio unless the speaker clearly switches language.'
+          ].join(' ')
         }]
       },
       realtimeInputConfig: {
@@ -145,8 +186,8 @@ function setupMessage() {
         automaticActivityDetection: {
           startOfSpeechSensitivity: 'START_SENSITIVITY_HIGH',
           endOfSpeechSensitivity: 'END_SENSITIVITY_HIGH',
-          prefixPaddingMs: 20,
-          silenceDurationMs: 250
+          prefixPaddingMs: settings.prefixPaddingMs,
+          silenceDurationMs: settings.silenceDurationMs
         }
       },
       inputAudioTranscription: {},
@@ -189,6 +230,7 @@ export default function ReceiverApp() {
   const [input, setInput] = useState('');
   const [output, setOutput] = useState('');
   const [log, setLog] = useState<string[]>([]);
+  const [asrMode, setAsrMode] = useState<AsrMode>('quality');
 
   const ctxRef = useRef<AudioContext | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
@@ -207,9 +249,10 @@ export default function ReceiverApp() {
   const audioInRef = useRef(0);
   const inputRef = useRef('');
   const outputRef = useRef('');
+  const currentModeRef = useRef<AsrMode>('quality');
 
   const addLog = (text: string) => {
-    setLog((items) => [`${new Date().toLocaleTimeString()} - ${text}`, ...items].slice(0, 12));
+    setLog((items) => [`${new Date().toLocaleTimeString()} - ${text}`, ...items].slice(0, 14));
   };
 
   function sendEnd() {
@@ -224,8 +267,10 @@ export default function ReceiverApp() {
   }
 
   function maybeEndSegment() {
-    if (segmentChunksRef.current < MIN_CHUNKS) return;
-    if (performance.now() - segmentStartRef.current < SEGMENT_MS) return;
+    const forcedSegmentMs = ASR_SETTINGS[currentModeRef.current].forcedSegmentMs;
+    if (forcedSegmentMs <= 0) return;
+    if (segmentChunksRef.current < 3) return;
+    if (performance.now() - segmentStartRef.current < forcedSegmentMs) return;
     sendEnd();
   }
 
@@ -273,7 +318,7 @@ export default function ReceiverApp() {
 
     if (msg.setupComplete) {
       readyRef.current = true;
-      addLog('Gemini direct ready. Receiving Hebrew source.');
+      addLog(`Gemini direct ready. ${ASR_SETTINGS[currentModeRef.current].title} is active.`);
     }
 
     if (msg.error?.message) {
@@ -344,7 +389,8 @@ export default function ReceiverApp() {
       const ws = wsRef.current;
       if (!ws || ws.readyState !== WebSocket.OPEN || !ctxRef.current) return;
 
-      const down = downsampleBuffer(boost(samples), ctxRef.current.sampleRate, INPUT_SAMPLE_RATE);
+      const settings = ASR_SETTINGS[currentModeRef.current];
+      const down = downsampleBuffer(boost(samples, settings.gain), ctxRef.current.sampleRate, INPUT_SAMPLE_RATE);
       const pcm = floatTo16BitPCM(down);
 
       const audioBuffer = new ArrayBuffer(pcm.byteLength);
@@ -357,7 +403,7 @@ export default function ReceiverApp() {
 
       maybeEndSegment();
 
-      if (sentRef.current === 1 || sentRef.current % 200 === 0) {
+      if (sentRef.current === 1 || sentRef.current % 250 === 0) {
         addLog(`Input audio sent: ${sentRef.current}.`);
       }
     };
@@ -373,6 +419,8 @@ export default function ReceiverApp() {
   async function start() {
     try {
       await stop(false);
+
+      currentModeRef.current = asrMode;
 
       setStatus('connecting');
       setError('');
@@ -395,14 +443,14 @@ export default function ReceiverApp() {
 
       await attachMic(stream);
 
-      addLog('Getting Gemini direct pass...');
+      addLog(`Getting Gemini direct pass. Mode: ${ASR_SETTINGS[asrMode].title}.`);
 
       const { ws, version } = await openDirectSocket();
 
       wsRef.current = ws;
 
       ws.onopen = () => {
-        ws.send(JSON.stringify(setupMessage()));
+        ws.send(JSON.stringify(setupMessage(asrMode)));
         runningRef.current = true;
         setStatus('receiving');
         addLog(`Direct Gemini socket opened (${version}).`);
@@ -464,17 +512,22 @@ export default function ReceiverApp() {
     }
   }
 
+  const activeSettings = ASR_SETTINGS[asrMode];
+
   return <main className="app-shell">
     <section className="hero-card">
-      <div className="eyebrow">Gemini direct receiver</div>
-      <h1>Hebrew source в†’ Russian in AirPods</h1>
+      <div className="eyebrow">Hebrew → Russian · Live Audio</div>
+      <h1>Hebrew speech → Russian in AirPods</h1>
       <p className="subtitle">
-        Direct client-to-Gemini mode. Cloudflare only creates a short pass; audio bypasses the Worker proxy.
+        Улучшенный режим распознавания иврита: меньше клиппинга, длиннее речевые фрагменты, без принудительного разрезания слов каждые 300 мс.
       </p>
+      <div className="warning">
+        Для лучшего Hebrew ASR используйте микрофон iPhone/iPad рядом с говорящим. AirPods лучше оставить только как выход русского звука.
+      </div>
       {error && <div className="error">{error}</div>}
       <div className="controls">
         <button className="primary" disabled={status === 'connecting' || status === 'receiving'} onClick={() => void start()}>
-          Start direct receiver
+          Start receiver
         </button>
         <button className="secondary" onClick={() => void stop()}>
           Stop
@@ -488,6 +541,22 @@ export default function ReceiverApp() {
 
     <section className="grid">
       <div className="panel">
+        <h2>ASR mode</h2>
+        <label className="field-label" htmlFor="asr-mode">Recognition mode</label>
+        <select id="asr-mode" value={asrMode} onChange={(event) => setAsrMode(event.target.value as AsrMode)} disabled={status === 'connecting' || status === 'receiving'}>
+          <option value="quality">Quality Hebrew ASR</option>
+          <option value="fast">Fast live mode</option>
+        </select>
+        <p>{activeSettings.note}</p>
+        <div className="debug-kv">
+          <span>Language hint</span><strong>Israeli Hebrew</strong>
+          <span>Input format</span><strong>PCM 16 kHz mono</strong>
+          <span>Silence end</span><strong>{activeSettings.silenceDurationMs} ms</strong>
+          <span>Forced cut</span><strong>{activeSettings.forcedSegmentMs ? `${activeSettings.forcedSegmentMs} ms` : 'off'}</strong>
+        </div>
+      </div>
+
+      <div className="panel">
         <h2>Input microphone</h2>
         <p>Active: {micName}</p>
         <div className="meter">
@@ -495,17 +564,29 @@ export default function ReceiverApp() {
         </div>
         <p>Level: {micLevel}%</p>
       </div>
+    </section>
+
+    <section className="grid">
+      <div className="panel">
+        <h2>Raw Hebrew transcript</h2>
+        <p dir="rtl" lang="he">{input || 'כאן יופיע הטקסט שהמערכת שמעה בעברית.'}</p>
+      </div>
 
       <div className="panel">
-        <h2>Russian output</h2>
-        <p>{output || 'Russian translation will appear and play here.'}</p>
+        <h2>Russian translation</h2>
+        <p>{output || 'Русский перевод появится здесь и будет проигрываться в наушники.'}</p>
       </div>
     </section>
 
     <section className="grid">
       <div className="panel">
-        <h2>Hebrew heard</h2>
-        <p>{input || 'Hebrew transcript will appear here.'}</p>
+        <h2>Test phrases</h2>
+        <ul className="hebrew-examples">
+          <li dir="rtl" lang="he">שלום, אני רוצה לבדוק את התרגום</li>
+          <li dir="rtl" lang="he">איפה התחנה המרכזית?</li>
+          <li dir="rtl" lang="he">כמה זה עולה?</li>
+          <li dir="rtl" lang="he">אני צריך להגיע לתל אביב</li>
+        </ul>
       </div>
 
       <div className="panel">
